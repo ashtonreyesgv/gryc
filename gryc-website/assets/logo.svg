@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" role="img" aria-label="GRYC">
+  <path fill="currentColor" d="M60 8C31 8 10 30 10 60s21 52 50 52c12 0 23-4 31-10V52H62v16h14v18c-4 3-10 5-16 5-17 0-29-13-29-31s12-31 29-31c9 0 17 4 22 10l12-12C86 15 74 8 60 8z"/>
+  <circle cx="34" cy="94" r="6" fill="#E5007E"/>
+  <circle cx="52" cy="100" r="6" fill="#1B3A93"/>
+  <circle cx="70" cy="102" r="6" fill="#FFCC00"/>
+  <circle cx="88" cy="98" r="6" fill="#00A651"/>
+</svg>

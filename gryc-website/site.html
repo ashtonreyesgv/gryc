@@ -1,0 +1,1115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Worksite · GRYC SYEP Site Monitor Portal</title>
+<link rel="icon" href="assets/images/gryc_logo.png">
+<link rel="stylesheet" href="assets/styles.css?v=15">
+</head>
+<body>
+
+<main class="page"><div class="wrap">
+
+  <div class="crumb"><a href="dashboard.html">My Sites</a> <span class="muted">/</span> <span id="crumbname"></span></div>
+
+  <div class="sitehead" id="sitehead"></div>
+
+  <div class="tabs" id="tabs">
+    <button data-tab="overview" class="on">Overview</button>
+    <button data-tab="application">Worksite Application</button>
+    <button data-tab="participants">Participants</button>
+    <button data-tab="log">Monitoring Log</button>
+    <button data-tab="weekly">Weekly</button>
+  </div>
+
+  <section id="pane"></section>
+
+</div></main>
+
+<script src="assets/data.js?v=15"></script>
+<script src="assets/app.js?v=15"></script>
+<script>
+(function () {
+  var $ = GRYC.$, $$ = GRYC.$$, esc = GRYC.esc;
+  var user = GRYC.requireAuth();
+  if (!user) return;
+  GRYC.renderHeader('sites');
+
+  var site = GRYC.site(GRYC.param('id'));
+  if (!site) {
+    document.querySelector('.wrap').innerHTML =
+      '<div class="card"><div class="empty"><div class="big">🤷</div>' +
+      '<p>That worksite could not be found.</p><a class="btn" href="dashboard.html">Back to my sites</a></div></div>';
+    return;
+  }
+
+  var cw = GRYC.currentWeek();
+  var selWeek = +(GRYC.param('week') || cw);
+  var tab = GRYC.param('tab') || 'overview';
+  var rosterFilter = '';
+  var tsOpen = false;
+
+  document.title = site.name + ' · GRYC SYEP Portal';
+  $('#crumbname').textContent = site.name;
+
+  function active() { return GRYC.activeParticipants(site); }
+
+  /* ================= header ================= */
+
+  function openVisit() {
+    return (site.log || []).filter(function (l) {
+      return !l.timeOut && l.date === GRYC.todayISO();
+    })[0] || null;
+  }
+
+  function nowSlot() { return GRYC.snap15(new Date().getHours() + ':' + new Date().getMinutes()); }
+
+  /* Time out opens at the next quarter hour after check-in, not at now. Most
+     visits are a timesheet pickup that takes a couple of minutes, and "now"
+     snaps straight back to the check-in slot — which the log then refuses,
+     because check-out has to be after check-in. A longer visit changes it.
+
+     Read off TIME_SLOTS rather than computed, so it is always an option the
+     dropdown actually has. A check-in at the last slot of the day has nothing
+     after it; that one the monitor has to sort out by hand. */
+  function checkoutSlot(timeIn) {
+    var after = GRYC.TIME_SLOTS.filter(function (t) {
+      return GRYC.minutes(t) > GRYC.minutes(timeIn);
+    });
+    return after[0] || GRYC.TIME_SLOTS[GRYC.TIME_SLOTS.length - 1];
+  }
+
+  function renderHead() {
+    var open = openVisit();
+    var todayVisits = (site.log || []).filter(function (l) { return l.date === GRYC.todayISO(); });
+
+    $('#sitehead').innerHTML =
+      '<div class="icon">' + esc(site.emoji || '🏢') + '</div>' +
+      '<div style="flex:1;min-width:220px">' +
+        '<h1>' + esc(site.name) + '</h1>' +
+        '<div class="muted small">' + esc(GRYC.fullAddress(site)) +
+          (site.dycdId ? ' · <span class="mono">' + esc(site.dycdId) + '</span>' : '') +
+          ' · ' + esc(site.worksiteType) +
+          (site.childcare ? ' · <span class="badge warn">Childcare site</span>' : '') +
+          (site.applicationOnFile ? '' : ' · <span class="badge bad">No application on file</span>') +
+        '</div>' +
+      '</div>' +
+      '<div class="row">' +
+        (open
+          ? '<span class="badge ok"><span class="dot"></span>Checked in ' + esc(GRYC.fmtTime(open.timeIn)) + '</span>' +
+            '<button class="btn primary" id="checkout">Check out</button>'
+          : '<button class="btn primary" id="checkin">Check in</button>') +
+        (todayVisits.length && !open ? '<span class="badge">Visit logged today</span>' : '') +
+      '</div>';
+
+    if ($('#checkin')) $('#checkin').addEventListener('click', doCheckIn);
+    if ($('#checkout')) $('#checkout').addEventListener('click', doCheckOut);
+  }
+
+  /* Reason-for-visit block: exactly the three boxes on the paper log. */
+  function reasonsHTML(sel, otherText) {
+    sel = sel || [];
+    return GRYC.VISIT_REASONS.map(function (r) {
+      var on = sel.indexOf(r.id) > -1;
+      return '<label class="check' + (on ? ' on' : '') + '">' +
+        '<input type="checkbox" data-reason="' + r.id + '"' + (on ? ' checked' : '') + '>' +
+        '<span class="ct">' + esc(r.label) + '</span></label>' +
+        (r.id === 'other'
+          ? '<input type="text" id="ci_other" class="mb-1" placeholder="Other — describe the visit" value="' +
+            esc(otherText || '') + '"' + (on ? '' : ' disabled') + '>'
+          : '');
+    }).join('');
+  }
+
+  function wireReasons(root) {
+    GRYC.$$('[data-reason]', root).forEach(function (cb) {
+      cb.addEventListener('change', function () {
+        cb.closest('.check').classList.toggle('on', cb.checked);
+        if (cb.dataset.reason === 'other') {
+          var t = GRYC.$('#ci_other', root);
+          t.disabled = !cb.checked;
+          if (cb.checked) t.focus();
+        }
+      });
+    });
+  }
+
+  function readReasons(root) {
+    return GRYC.$$('[data-reason]', root)
+      .filter(function (c) { return c.checked; })
+      .map(function (c) { return c.dataset.reason; });
+  }
+
+  function doCheckIn() {
+    GRYC.modal({
+      title: 'Check in to ' + site.name,
+      okText: 'Check in',
+      body:
+        '<div class="grid c2">' +
+          '<div class="field"><label>Date</label><input type="date" id="ci_date" value="' + GRYC.todayISO() + '"></div>' +
+          '<div class="field"><label>Time in</label>' + GRYC.timeSelect('id="ci_time"', nowSlot(), { blank: false }) + '</div>' +
+        '</div>' +
+        '<div class="field mb-0"><label class="req">Reason for Visit <span class="muted">(check all applicable)</span></label>' +
+          reasonsHTML(['monitoring'], '') +
+        '</div>',
+      onOk: function (root) {
+        var reasons = readReasons(root);
+        if (!reasons.length) { GRYC.toast('Pick at least one reason for the visit.', 'bad'); return false; }
+        site.log.unshift({
+          id: GRYC.uid('lg'),
+          date: GRYC.$('#ci_date', root).value,
+          timeIn: GRYC.$('#ci_time', root).value,
+          timeOut: '',
+          monitor: user.name,
+          reasons: reasons,
+          otherText: GRYC.$('#ci_other', root).value.trim(),
+          notes: ''
+        });
+        GRYC.save();
+        GRYC.toast('Checked in. The monitoring log is updated.', 'ok');
+        renderHead(); paint();
+      }
+    });
+    wireReasons(document);
+  }
+
+  function doCheckOut() {
+    var v = openVisit();
+    GRYC.modal({
+      title: 'Check out',
+      okText: 'Check out',
+      body:
+        '<div class="field"><label>Time out</label>' +
+          GRYC.timeSelect('id="co_time"', checkoutSlot(v.timeIn), { blank: false }) + '</div>' +
+        '<div class="field mb-0"><label>Visit notes (optional)</label>' +
+          '<textarea id="co_notes" rows="3" placeholder="Anything worth recording about this visit…"></textarea></div>',
+      onOk: function (root) {
+        var t = GRYC.$('#co_time', root).value;
+        if (GRYC.minutes(t) <= GRYC.minutes(v.timeIn)) {
+          GRYC.toast('Time out has to be after ' + GRYC.fmtTime(v.timeIn) + '.', 'bad');
+          return false;
+        }
+        v.timeOut = t;
+        v.notes = GRYC.$('#co_notes', root).value.trim();
+        GRYC.save();
+        GRYC.toast('Checked out.', 'ok');
+        renderHead(); paint();
+      }
+    });
+  }
+
+  /* ================= tabs ================= */
+
+  $$('#tabs button').forEach(function (b) {
+    b.classList.toggle('on', b.dataset.tab === tab);
+    b.addEventListener('click', function () {
+      tab = b.dataset.tab;
+      $$('#tabs button').forEach(function (x) { x.classList.toggle('on', x === b); });
+      history.replaceState(null, '', 'site.html?id=' + site.id + '&tab=' + tab + '&week=' + selWeek);
+      paint();
+    });
+  });
+
+  function paint() {
+    if (tab === 'overview') paneOverview();
+    else if (tab === 'application') paneApplication();
+    else if (tab === 'participants') paneParticipants();
+    else if (tab === 'log') paneLog();
+    else paneWeekly();
+  }
+
+  function kv(k, v) {
+    return '<div><div class="lbl">' + esc(k) + '</div><div>' +
+      (v == null || v === '' ? '<span class="muted">—</span>' : esc(v)) + '</div></div>';
+  }
+  function miniRow(k, v) {
+    return '<div class="row between" style="padding:6px 0;border-bottom:1px solid var(--line-2)">' +
+      '<span class="muted small">' + esc(k) + '</span><span class="strong">' + esc(v) + '</span></div>';
+  }
+
+  /* ================= overview ================= */
+
+  function paneOverview() {
+    var prog = GRYC.docProgress(site);
+    var primary = GRYC.primarySupervisor(site);
+
+    $('#pane').innerHTML =
+      '<div class="grid side">' +
+        '<div>' +
+          '<div class="card mb-2">' +
+            '<div class="card-h"><h2>Worksite information</h2>' +
+              '<div class="spacer"></div><button class="btn sm" id="editinfo">Edit</button></div>' +
+            '<div class="card-b">' +
+            (site.addressNote
+              ? '<div class="callout mb-2"><strong>Address correction.</strong> ' +
+                esc(site.addressNote) + '</div>'
+              : '') +
+            '<div class="grid c2">' +
+              kv('Worksite Name', site.name) +
+              kv('Worksite Type', site.worksiteType) +
+              kv('Address', GRYC.fullAddress(site)) +
+              kv('Between/Cross Streets', site.crossStreets) +
+              kv('Travel Directions', (site.travel || '').replace(/\n/g, ' · ')) +
+              kv('Site Implementation', site.implementation) +
+              kv('Sector', site.sector) +
+              kv('Industry', site.industry) +
+            '</div></div>' +
+          '</div>' +
+
+          '<div class="card mb-2">' +
+            '<div class="card-h"><h2>Participant duties</h2>' +
+              '<div class="spacer"></div><button class="btn sm" id="editduties">Edit</button></div>' +
+            '<div class="card-b">' +
+              (site.jobs.length
+                ? site.jobs.map(function (j, i) {
+                    return '<div' + (i ? ' class="mt-3"' : '') + '>' +
+                      '<div class="row wrap-row" style="gap:6px;margin-bottom:6px">' +
+                        '<span class="badge info">' + esc(j.category || 'Other') + '</span>' +
+                        '<span class="strong">' + esc(j.title) + '</span>' +
+                        '<span class="badge">' + esc(j.assigned) + ' participants</span>' +
+                      '</div>' +
+                      '<p class="small mb-1">' + esc(j.duties) + '</p>' +
+                      (j.special ? '<div class="lbl mt-1">Special requirements</div>' +
+                        '<p class="small mb-0">' + esc(j.special) + '</p>' : '') +
+                    '</div>';
+                  }).join('')
+                : '<p class="muted mb-0">No job duties on file yet. These pre-fill the weekly assessment ' +
+                  '(Program Activities Q4 and, for childcare sites, the daily responsibilities box).</p>') +
+            '</div>' +
+          '</div>' +
+
+          '<div class="card">' +
+            '<div class="card-h"><h2>Supervision &amp; management</h2>' +
+              '<div class="spacer"></div><button class="btn sm" id="addsup">+ Add supervisor</button></div>' +
+            '<div class="tbl-wrap"><table class="tbl"><thead><tr>' +
+              '<th>Name</th><th>Title</th><th>Email</th><th>Phone</th>' +
+              '<th class="center">Signs<br>attendance</th><th></th>' +
+            '</tr></thead><tbody>' +
+            (site.supervisors.length ? site.supervisors.map(function (v) {
+              return '<tr><td class="strong">' + esc(v.name) +
+                (v.siteRep ? ' <span class="badge info">Site rep</span>' : '') +
+                (v.keyMgmt ? ' <span class="badge">Key mgmt</span>' : '') + '</td>' +
+                '<td>' + esc(v.title || '—') + '</td>' +
+                '<td>' + (v.email ? '<a href="mailto:' + esc(v.email) + '">' + esc(v.email) + '</a>' : '—') + '</td>' +
+                '<td class="nowrap">' + esc(v.phone || '—') + '</td>' +
+                '<td class="center">' + (v.signAttendance ? '✓' : '—') + '</td>' +
+                '<td class="right"><button class="btn sm ghost danger" data-delsup="' + esc(v.id) + '">Remove</button></td></tr>';
+            }).join('') : '<tr><td colspan="6" class="muted center" style="padding:24px">No supervisors listed.</td></tr>') +
+            '</tbody></table></div>' +
+            '<div class="card-f small muted">' +
+              (site.ftEmployees ? esc(site.ftEmployees) + ' full-time employees · ' : '') +
+              (site.supervisingStaff ? esc(site.supervisingStaff) + ' responsible for supervising youth' : '') +
+            '</div>' +
+          '</div>' +
+        '</div>' +
+
+        '<div>' +
+          '<div class="card mb-2"><div class="card-b">' +
+            '<h3 class="mb-2">Paperwork this summer</h3>' +
+            '<div class="row between small" style="margin-bottom:6px"><span class="muted">Complete</span>' +
+              '<span class="strong">' + prog.done + ' / ' + prog.total + '</span></div>' +
+            '<div class="meter"><i style="width:' + prog.pct + '%"></i></div>' +
+            '<div class="tiny muted mt-1">Counts only documents due on or before Week ' + cw + '.</div>' +
+          '</div></div>' +
+
+          '<div class="card mb-2"><div class="card-b">' +
+            '<h3 class="mb-2">At a glance</h3>' +
+            miniRow('Participants requested', site.requested || '—') +
+            miniRow('On roster (active)', active().length) +
+            miniRow('Supervisors', site.supervisors.length) +
+            miniRow('Visits logged', (site.log || []).length) +
+            miniRow('Assessments filed', Object.keys(site.weeks).filter(function (k) {
+              return site.weeks[k].assessment && site.weeks[k].assessment.status === 'submitted';
+            }).length) +
+          '</div></div>' +
+
+          (primary
+            ? '<div class="card mb-2"><div class="card-b">' +
+              '<h3 class="mb-2">Site representative</h3>' +
+              '<div class="strong">' + esc(primary.name) + '</div>' +
+              '<div class="tiny muted mb-1">' + esc(primary.title || '') + '</div>' +
+              (primary.phone ? '<div class="small">' + esc(primary.phone) + '</div>' : '') +
+              (primary.email ? '<div class="small"><a href="mailto:' + esc(primary.email) + '">' +
+                esc(primary.email) + '</a></div>' : '') +
+            '</div></div>'
+            : '') +
+
+          '<div class="card"><div class="card-b">' +
+            '<h3 class="mb-2">Assigned monitor</h3>' +
+            '<div class="row"><div class="avatar">' + esc(GRYC.initials(user.name)) + '</div>' +
+            '<div><div class="strong">' + esc(user.name) + '</div>' +
+            '<div class="tiny muted">' + esc(user.email) + '</div></div></div>' +
+          '</div></div>' +
+        '</div>' +
+      '</div>';
+
+    $('#editinfo').addEventListener('click', editInfo);
+    $('#editduties').addEventListener('click', editDuties);
+    $('#addsup').addEventListener('click', addSupervisor);
+    $$('[data-delsup]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        site.supervisors = site.supervisors.filter(function (v) { return v.id !== b.dataset.delsup; });
+        GRYC.save(); GRYC.toast('Supervisor removed.'); paint();
+      });
+    });
+  }
+
+  function editInfo() {
+    GRYC.modal({
+      title: 'Edit worksite information', wide: true, okText: 'Save',
+      body:
+        '<div class="grid c2">' +
+          '<div class="field"><label class="req">Worksite Name</label>' +
+            '<input type="text" id="e_name" value="' + esc(site.name) + '"></div>' +
+          '<div class="field"><label>Site code / DYCD ID</label>' +
+            '<input type="text" id="e_dycd" value="' + esc(site.dycdId) + '"></div>' +
+        '</div>' +
+        '<div class="grid c2">' +
+          '<div class="field"><label>Address</label>' +
+            '<input type="text" id="e_addr" value="' + esc(site.address) + '"></div>' +
+          '<div class="field"><label>Room/Floor/Suite</label>' +
+            '<input type="text" id="e_room" value="' + esc(site.room) + '"></div>' +
+        '</div>' +
+        '<div class="grid c3">' +
+          '<div class="field"><label>Borough</label><select id="e_boro">' +
+            GRYC.BOROUGHS.map(function (b) {
+              return '<option' + (site.borough === b ? ' selected' : '') + '>' + esc(b) + '</option>';
+            }).join('') + '</select></div>' +
+          '<div class="field"><label>ZIP</label><input type="text" id="e_zip" value="' + esc(site.zip) + '"></div>' +
+          '<div class="field"><label>Worksite Type</label><select id="e_wtype">' +
+            GRYC.WORKSITE_TYPES.map(function (t) {
+              return '<option' + (site.worksiteType === t ? ' selected' : '') + '>' + esc(t) + '</option>';
+            }).join('') + '</select></div>' +
+        '</div>' +
+        '<div class="field"><label>Between/Cross Streets</label>' +
+          '<input type="text" id="e_cross" value="' + esc(site.crossStreets) + '"></div>' +
+        '<div class="field"><label>Travel Directions <span class="muted">(train / bus info)</span></label>' +
+          '<textarea id="e_travel" rows="2">' + esc(site.travel) + '</textarea></div>' +
+        '<div class="grid c3">' +
+          '<div class="field mb-0"><label>Site Implementation</label><select id="e_impl">' +
+            GRYC.IMPLEMENTATION.map(function (t) {
+              return '<option' + (site.implementation === t ? ' selected' : '') + '>' + esc(t) + '</option>';
+            }).join('') + '</select></div>' +
+          '<div class="field mb-0"><label>Sector</label><select id="e_sector">' +
+            GRYC.SECTORS.map(function (t) {
+              return '<option' + (site.sector === t ? ' selected' : '') + '>' + esc(t) + '</option>';
+            }).join('') + '</select></div>' +
+          '<div class="field mb-0"><label>Industry</label>' +
+            '<input type="text" id="e_ind" value="' + esc(site.industry) + '"></div>' +
+        '</div>' +
+        '<label class="check mt-2 mb-0' + (site.childcare ? ' on' : '') + '">' +
+          '<input type="checkbox" id="e_cc"' + (site.childcare ? ' checked' : '') + '>' +
+          '<span class="ct">Childcare site — adds the Childcare Site Questions to every assessment ' +
+          'and a childcare questionnaire for every participant</span></label>',
+      onOk: function (r) {
+        site.name = GRYC.$('#e_name', r).value.trim() || site.name;
+        site.dycdId = GRYC.$('#e_dycd', r).value.trim();
+        site.address = GRYC.$('#e_addr', r).value.trim();
+        site.room = GRYC.$('#e_room', r).value.trim();
+        site.borough = GRYC.$('#e_boro', r).value;
+        site.zip = GRYC.$('#e_zip', r).value.trim();
+        site.worksiteType = GRYC.$('#e_wtype', r).value;
+        site.crossStreets = GRYC.$('#e_cross', r).value.trim();
+        site.travel = GRYC.$('#e_travel', r).value.trim();
+        site.implementation = GRYC.$('#e_impl', r).value;
+        site.sector = GRYC.$('#e_sector', r).value;
+        site.industry = GRYC.$('#e_ind', r).value.trim();
+        site.childcare = GRYC.$('#e_cc', r).checked;
+        GRYC.save(); GRYC.toast('Saved.', 'ok');
+        $('#crumbname').textContent = site.name;
+        renderHead(); paint();
+      }
+    });
+  }
+
+  function editDuties() {
+    var j = site.jobs[0] || { category: 'Other', title: '', duties: '', restrictions: '', assigned: '', special: '' };
+    GRYC.modal({
+      title: 'Job title and duties', wide: true, okText: 'Save',
+      body:
+        '<div class="grid c3">' +
+          '<div class="field"><label>Category</label>' +
+            '<input type="text" id="j_cat" value="' + esc(j.category) + '" placeholder="Duty category"></div>' +
+          '<div class="field"><label>Job Title</label>' +
+            '<input type="text" id="j_title" value="' + esc(j.title) + '"></div>' +
+          '<div class="field"><label># assigned to these duties</label>' +
+            '<input type="number" id="j_num" min="0" value="' + esc(j.assigned) + '"></div>' +
+        '</div>' +
+        '<div class="field"><label class="req">Duties</label>' +
+          '<textarea id="j_duties" rows="4">' + esc(j.duties) + '</textarea>' +
+          '<div class="hint">This is what Program Activities Q4 is checked against, and it pre-fills the ' +
+            'childcare "daily responsibilities" box.</div></div>' +
+        '<div class="field"><label>Restrictions</label>' +
+          '<textarea id="j_restrict" rows="2">' + esc(j.restrictions) + '</textarea></div>' +
+        '<div class="field mb-0"><label>Special Requirements</label>' +
+          '<textarea id="j_special" rows="2">' + esc(j.special) + '</textarea></div>',
+      onOk: function (r) {
+        var next = {
+          category: GRYC.$('#j_cat', r).value.trim(),
+          title: GRYC.$('#j_title', r).value.trim(),
+          assigned: GRYC.$('#j_num', r).value.trim(),
+          duties: GRYC.$('#j_duties', r).value.trim(),
+          restrictions: GRYC.$('#j_restrict', r).value.trim(),
+          special: GRYC.$('#j_special', r).value.trim(),
+          must18: j.must18 || ''
+        };
+        if (site.jobs.length) site.jobs[0] = next; else site.jobs.push(next);
+        GRYC.save(); GRYC.toast('Saved.', 'ok'); paint();
+      }
+    });
+  }
+
+  function addSupervisor() {
+    GRYC.modal({
+      title: 'Add supervisor', wide: true, okText: 'Add',
+      body:
+        '<div class="grid c2">' +
+          '<div class="field"><label class="req">Name <span class="muted">(Last, First)</span></label>' +
+            '<input type="text" id="s_name" placeholder="Last name, First name"></div>' +
+          '<div class="field"><label>Title</label><input type="text" id="s_title"></div>' +
+        '</div>' +
+        '<div class="grid c3">' +
+          '<div class="field"><label>Email</label><input type="email" id="s_email"></div>' +
+          '<div class="field"><label>Phone</label><input type="tel" id="s_phone"></div>' +
+          '<div class="field"><label>Area of Supervision</label><input type="text" id="s_area"></div>' +
+        '</div>' +
+        '<label class="check"><input type="checkbox" id="s_rep">' +
+          '<span class="ct">Site Representative</span></label>' +
+        '<label class="check"><input type="checkbox" id="s_key">' +
+          '<span class="ct">Key Management Personnel</span></label>' +
+        '<label class="check mb-0"><input type="checkbox" id="s_sign" checked>' +
+          '<span class="ct">Authorized to sign Attendance Sheets</span></label>',
+      onOk: function (r) {
+        var n = GRYC.$('#s_name', r).value.trim();
+        if (!n) { GRYC.toast('Name is required.', 'bad'); return false; }
+        site.supervisors.push({
+          id: GRYC.uid('sv'), name: n,
+          title: GRYC.$('#s_title', r).value.trim(),
+          email: GRYC.$('#s_email', r).value.trim(),
+          phone: GRYC.$('#s_phone', r).value.trim(),
+          fax: '',
+          area: GRYC.$('#s_area', r).value.trim(), room: '', trained: true,
+          siteRep: GRYC.$('#s_rep', r).checked,
+          keyMgmt: GRYC.$('#s_key', r).checked,
+          signAttendance: GRYC.$('#s_sign', r).checked,
+          isSupervisor: true
+        });
+        GRYC.save(); GRYC.toast('Supervisor added.', 'ok'); paint();
+      }
+    });
+  }
+
+  /* ================= worksite application ================= */
+
+  function paneApplication() {
+    if (!site.applicationOnFile) {
+      $('#pane').innerHTML =
+        '<div class="card"><div class="empty"><div class="big">📄</div>' +
+        '<p class="strong">No Worksite Application imported</p>' +
+        '<p class="muted">Once GRYC loads the application, the general information, supervisors, schedule and ' +
+        'job duties all flow straight into the weekly assessment.</p>' +
+        '<button class="btn" id="editinfo2">Fill it in manually</button></div></div>';
+      $('#editinfo2').addEventListener('click', editInfo);
+      return;
+    }
+
+    var cc = site.cc;
+
+    $('#pane').innerHTML =
+      '<div class="card mb-2"><div class="card-h"><h2>General Information</h2>' +
+        '<div class="spacer"></div><span class="badge">' + esc(GRYC.PROGRAM.cycle) + '</span></div>' +
+        '<div class="card-b"><div class="grid c3">' +
+          kv('Initiative', GRYC.PROGRAM.initiative) +
+          kv('Provider Name', GRYC.PROGRAM.provider) +
+          kv('Organization Name', GRYC.PROGRAM.organization) +
+          kv('Worksite Name', site.applicationName || site.name) +
+          (site.applicationName ? kv('Known on site as', site.name) : '') +
+          kv('Address', site.address) +
+          kv('Borough/City · ZIP', site.borough + ' ' + site.zip) +
+          kv('Are you a City Agency', site.cityAgency) +
+          kv('Located in a DOE Building', site.doeBuilding) +
+          kv('Summer Rising Worksite', site.summerRising) +
+          kv('Between/Cross Streets', site.crossStreets) +
+          kv('Sector', site.sector) +
+          kv('Industry', site.industry) +
+          kv('Site Implementation', site.implementation) +
+          kv('ChildCare', site.childcare ? 'Yes' : 'No') +
+          kv('Nature/Environment Assignments', site.natureEnv) +
+        '</div>' +
+        (site.travel ? '<div class="lbl mt-2">Travel Directions</div>' +
+          '<p class="small mb-0" style="white-space:pre-line">' + esc(site.travel) + '</p>' : '') +
+        (site.description ? '<div class="lbl mt-2">Description</div>' +
+          '<p class="small mb-0">' + esc(site.description) + '</p>' : '') +
+        (site.website ? '<div class="lbl mt-2">Website</div>' +
+          '<p class="small mb-0"><a href="' + esc(site.website) + '" target="_blank" rel="noopener">' +
+          esc(site.website) + '</a></p>' : '') +
+      '</div></div>' +
+
+      '<div class="card mb-2"><div class="card-h"><h2>Job Duties &amp; Schedule</h2></div>' +
+        '<div class="card-b"><div class="grid c4">' +
+          kv('Participants requested', site.requested) +
+          kv('Supervisors : Participants', (site.ratioSup || '—') + ' : ' + (site.ratioPart || '—')) +
+          kv('Able to provide 150 hours', site.fullHours) +
+          kv('Staggered schedules', site.staggered) +
+        '</div></div>' +
+        (site.schedules.length
+          ? '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Name</th>' +
+            GRYC.DAY_LABELS.map(function (d) { return '<th>' + d + '</th>'; }).join('') +
+            '</tr></thead><tbody>' +
+            site.schedules.map(function (sc) {
+              return '<tr><td class="strong nowrap">' + esc(sc.name) + '</td>' +
+                GRYC.DAYS.map(function (d) {
+                  return '<td class="tiny">' + esc(sc[d] || '—') + '</td>';
+                }).join('') + '</tr>';
+            }).join('') + '</tbody></table></div>'
+          : '') +
+      '</div>' +
+
+      (site.jobs.length
+        ? '<div class="card mb-2"><div class="card-h"><h2>Job Titles and Duties</h2></div><div class="card-b">' +
+          site.jobs.map(function (j, i) {
+            return '<div' + (i ? ' class="mt-3" style="border-top:1px solid var(--line-2);padding-top:16px"' : '') + '>' +
+              '<div class="grid c3 mb-2">' + kv('Category', j.category) + kv('Job Title', j.title) +
+                kv('# assigned to these duties', j.assigned) + '</div>' +
+              '<div class="lbl">Duties</div><p class="small">' + esc(j.duties) + '</p>' +
+              (j.restrictions ? '<div class="lbl">Restrictions</div><p class="small">' + esc(j.restrictions) + '</p>' : '') +
+              (j.special ? '<div class="lbl">Special Requirements</div><p class="small mb-0">' + esc(j.special) + '</p>' : '') +
+            '</div>';
+          }).join('') + '</div></div>'
+        : '') +
+
+      (cc
+        ? '<div class="card mb-2"><div class="card-h"><h2>Attachment 1 — Child-care Sites</h2>' +
+          '<div class="spacer"></div><span class="badge warn">Licensed childcare-related worksite</span></div>' +
+          '<div class="card-b"><div class="grid c3">' +
+            kv('Type of facility', cc.facilityType) +
+            kv('Program dates', (cc.startDate ? GRYC.fmtSlash(cc.startDate) : '—') + ' to ' +
+              (cc.endDate ? GRYC.fmtSlash(cc.endDate) : '—')) +
+            kv('Children expected', cc.childrenServed) +
+            kv('Participants accompany children on trips', cc.trips) +
+            kv('Outdoor activities', cc.outdoor) +
+            kv('Child Care Screening Requirements', cc.screening) +
+            kv('Participants fingerprinted', cc.fingerprinted) +
+            kv(cc.licenseType || 'License', cc.licenseNumber) +
+            kv('Expiration date', cc.licenseExp ? GRYC.fmtSlash(cc.licenseExp) : '') +
+            kv('Out of City Worksite', cc.outOfCity) +
+          '</div></div></div>'
+        : '') +
+
+      '<div class="card"><div class="card-h"><h2>Required Attachments and Certifications</h2></div>' +
+        '<div class="card-b"><div class="grid c3">' +
+          kv('Federal/state/city investigation in last 5 years', site.certs.investigation) +
+          kv('Copy of most recent license/certificate on file', site.certs.licenseCopy ? 'Yes' : 'No') +
+          kv('Signed Site Assurances and Certifications Form', site.certs.assurances) +
+        '</div></div>' +
+      '</div>';
+  }
+
+  /* ================= participants ================= */
+
+  function paneParticipants() {
+    var docs = GRYC.docsFor(site);
+    var q = rosterFilter.toLowerCase();
+    var list = site.participants.filter(function (p) {
+      if (!q) return true;
+      return (GRYC.proster(p) + ' ' + p.appId + ' ' + p.phone + ' ' + p.borough).toLowerCase().indexOf(q) > -1;
+    });
+
+    /* Every document is a tick box. Anything not due yet still ticks — it just
+       carries a grey "not due yet" chip so you know it is running early.   */
+    var head = '<tr>' +
+      '<th>Application ID</th><th>Last Name</th><th>First Name</th><th>Program</th><th>Borough</th>' +
+      '<th>Phone</th><th class="center">Age</th><th>Cohort</th>' +
+      docs.map(function (d) {
+        return '<th class="center">' + esc(d.label) +
+          (d.dueWeek > cw
+            ? '<div class="th-chip"><span class="badge soft">Not due yet · wk ' + d.dueWeek + '</span></div>'
+            : '') + '</th>';
+      }).join('') + '<th></th></tr>';
+
+    var rows = list.map(function (p) {
+      var inactive = p.status !== 'Active';
+      return '<tr' + (inactive ? ' class="row-off"' : '') + '>' +
+        '<td class="mono small">' + esc(p.appId || '—') + '</td>' +
+        '<td class="strong">' + esc(p.last || '—') +
+          (inactive ? ' <span class="badge bad">' + esc(p.status) + '</span>' : '') +
+          (p.note ? ' <span class="note-dot" title="' + esc(p.note) + '">●</span>' : '') + '</td>' +
+        '<td>' + esc(p.first || '—') + '</td>' +
+        '<td class="small">' + esc(p.program) + '</td>' +
+        '<td class="small">' + esc(p.borough) + '</td>' +
+        '<td class="nowrap small">' + esc(p.phone || '—') + '</td>' +
+        '<td class="center">' + esc(p.age || '—') + '</td>' +
+        '<td class="tiny muted nowrap">' + esc(p.cohort) + '</td>' +
+        docs.map(function (d) {
+          var early = d.dueWeek > cw;
+          var on = !!p.docs[d.key];
+
+          /* A document the app can fill in is a button rather than a box —
+             submitting the form is what ticks it, so there is no way to have
+             a tick with nothing behind it. */
+          if (d.form) {
+            if (inactive) return '<td class="chk' + (early ? ' early' : '') + '"><span class="muted">—</span></td>';
+            return '<td class="chk' + (early ? ' early' : '') + '">' +
+              '<a class="btn sm nowrap' + (on ? ' ghost' : ' primary') + '" href="' + esc(d.form) +
+                '?site=' + esc(site.id) + '&p=' + esc(p.id) + '">' +
+                (on ? '✓ On file' : 'Fill out') + '</a></td>';
+          }
+
+          return '<td class="chk' + (early ? ' early' : '') + '">' +
+            '<input type="checkbox" data-doc="' + esc(d.key) + '" data-p="' + esc(p.id) + '"' +
+            (on ? ' checked' : '') + (inactive ? ' disabled' : '') + '></td>';
+        }).join('') +
+        '<td class="right"><button class="btn sm ghost" data-editp="' + esc(p.id) + '">Edit</button></td>' +
+      '</tr>';
+    }).join('');
+
+    var missing = GRYC.outstandingDocs(site);
+
+    $('#pane').innerHTML =
+      '<div class="card">' +
+        '<div class="card-h"><h2>Site Assignment Roster</h2>' +
+          '<span class="badge' + (missing ? ' warn' : ' ok') + '">' +
+            (missing ? missing + ' document' + (missing === 1 ? '' : 's') + ' outstanding' : 'All paperwork current') + '</span>' +
+          '<div class="spacer"></div>' +
+          '<input type="search" id="rsearch" class="inline-search" placeholder="Search roster…" value="' +
+            esc(rosterFilter) + '">' +
+          '<button class="btn sm" id="addppl">+ Import participants</button></div>' +
+        (site.participants.length
+          ? '<div class="tbl-wrap roster-wrap"><table class="tbl roster"><thead>' + head + '</thead><tbody>' +
+            (rows || '<tr><td colspan="20" class="muted center" style="padding:24px">Nothing matches “' +
+              esc(rosterFilter) + '”.</td></tr>') + '</tbody></table></div>'
+          : '<div class="empty"><div class="big">👥</div><p class="strong">No participants yet</p>' +
+            '<p class="muted">Enter them from the YEPS Worksite Assignments roster, or wait for the GRYC office to load it.</p></div>') +
+        '<div class="card-f small muted">' +
+          'Showing ' + list.length + ' of ' + site.participants.length + ' · ' +
+          active().length + ' active. Tick a box when the signed form is in hand — referral sheets ' +
+          'and the week 3 / week 6 evaluations stay on paper. ' +
+          (site.childcare
+            ? 'Childcare questionnaires are the exception: fill one in here and it ticks itself off.'
+            : '') +
+        '</div>' +
+      '</div>';
+
+    var search = $('#rsearch');
+    search.addEventListener('input', function () {
+      rosterFilter = search.value;
+      var pos = search.selectionStart;
+      paneParticipants();
+      var s2 = $('#rsearch'); s2.focus(); s2.setSelectionRange(pos, pos);
+    });
+
+    $$('[data-doc]').forEach(function (cb) {
+      cb.addEventListener('change', function () {
+        var p = GRYC.participant(site, cb.dataset.p);
+        p.docs[cb.dataset.doc] = cb.checked;
+        GRYC.save();
+        GRYC.toast(GRYC.proster(p) + ' — ' + (cb.checked ? 'marked received' : 'unmarked') + '.');
+        paneParticipants();
+      });
+    });
+
+    $$('[data-editp]').forEach(function (b) {
+      b.addEventListener('click', function () { editParticipant(GRYC.participant(site, b.dataset.editp)); });
+    });
+
+    $('#addppl').addEventListener('click', importParticipants);
+  }
+
+  function editParticipant(p) {
+    GRYC.modal({
+      title: GRYC.proster(p), wide: true, okText: 'Save',
+      body:
+        '<div class="grid c3">' +
+          '<div class="field"><label>Application ID</label>' +
+            '<input type="text" id="p_app" value="' + esc(p.appId) + '"></div>' +
+          '<div class="field"><label class="req">Last Name</label>' +
+            '<input type="text" id="p_last" value="' + esc(p.last) + '"></div>' +
+          '<div class="field"><label>First Name</label>' +
+            '<input type="text" id="p_first" value="' + esc(p.first) + '"></div>' +
+        '</div>' +
+        '<div class="grid c3">' +
+          '<div class="field"><label>Borough</label><select id="p_boro">' +
+            GRYC.BOROUGHS.map(function (b) {
+              return '<option' + (p.borough === b ? ' selected' : '') + '>' + esc(b) + '</option>';
+            }).join('') + '</select></div>' +
+          '<div class="field"><label>Phone</label><input type="tel" id="p_phone" value="' + esc(p.phone) + '"></div>' +
+          '<div class="field"><label>Age</label>' +
+            '<input type="number" id="p_age" min="14" max="30" value="' + esc(p.age || '') + '"></div>' +
+        '</div>' +
+        '<div class="grid c3">' +
+          '<div class="field mb-0"><label>Date of birth</label>' +
+            '<input type="date" id="p_dob" value="' + esc(p.dob || '') + '">' +
+            '<div class="hint">Used by the interview page of the assessment.</div></div>' +
+          '<div class="field mb-0"><label>Cohort</label>' +
+            '<input type="text" id="p_cohort" value="' + esc(p.cohort) + '"></div>' +
+          '<div class="field mb-0"><label>Status</label><select id="p_status">' +
+            ['Active', 'Transferred', 'Terminated', 'Never reported'].map(function (s) {
+              return '<option' + (p.status === s ? ' selected' : '') + '>' + esc(s) + '</option>';
+            }).join('') + '</select></div>' +
+        '</div>',
+      onOk: function (r) {
+        p.appId = GRYC.$('#p_app', r).value.trim();
+        p.last = GRYC.$('#p_last', r).value.trim() || p.last;
+        p.first = GRYC.$('#p_first', r).value.trim();
+        p.borough = GRYC.$('#p_boro', r).value;
+        p.phone = GRYC.$('#p_phone', r).value.trim();
+        p.age = +GRYC.$('#p_age', r).value || null;
+        p.dob = GRYC.$('#p_dob', r).value;
+        p.cohort = GRYC.$('#p_cohort', r).value.trim();
+        p.status = GRYC.$('#p_status', r).value;
+        GRYC.save(); GRYC.toast('Saved.', 'ok'); paneParticipants();
+      }
+    });
+  }
+
+  function importParticipants() {
+    var dlg = GRYC.modal({
+      title: 'Import participants', wide: true, okText: 'Add to roster',
+      body:
+        '<p class="small">One row per youth, straight off the YEPS <em>Worksite Assignments</em> roster. ' +
+          'Blank rows are ignored, and anything you skip can be filled in later with <b>Edit</b>.</p>' +
+        GRYC.pgridHTML('imptbl', { borough: site.borough }),
+      onOk: function (r) {
+        var got = GRYC.pgridRead(r, 'imptbl');
+
+        if (got.incomplete) {
+          GRYC.toast('Every row needs a last name — ' + got.incomplete + ' row(s) highlighted.', 'bad');
+          return false;
+        }
+        if (!got.made.length) {
+          GRYC.toast('Fill in at least one row first.', 'bad');
+          return false;
+        }
+
+        got.made.forEach(function (p) { site.participants.push(p); });
+        GRYC.save();
+        GRYC.toast(got.made.length + ' participant(s) added to the roster.', 'ok');
+        paneParticipants();
+      }
+    });
+
+    GRYC.pgridWire(dlg, 'imptbl', { borough: function () { return site.borough; } });
+  }
+
+  /* ================= monitoring log ================= */
+
+  function reasonLabel(l) {
+    var ids = l.reasons || [];
+    var out = GRYC.VISIT_REASONS
+      .filter(function (r) { return ids.indexOf(r.id) > -1 && r.id !== 'other'; })
+      .map(function (r) { return r.label; });
+    if (ids.indexOf('other') > -1) out.push('Other: ' + (l.otherText || '—'));
+    return out.join(' · ') || '—';
+  }
+
+  function paneLog() {
+    var log = (site.log || []).slice().sort(function (a, b) {
+      return (b.date + (b.timeIn || '')).localeCompare(a.date + (a.timeIn || ''));
+    });
+    var primary = GRYC.primarySupervisor(site);
+
+    $('#pane').innerHTML =
+      '<div class="card">' +
+        '<div class="card-h"><h2>Monitoring Log</h2>' +
+          '<div class="spacer"></div>' +
+          '<button class="btn sm no-print" id="printlog">Print</button>' +
+          '<button class="btn sm no-print" id="manualentry">+ Manual entry</button></div>' +
+        '<div class="card-b tight"><div class="grid c3">' +
+          kv('Provider Name', GRYC.PROGRAM.provider) +
+          kv('Worksite Name', site.name) +
+          kv('Worksite Address', GRYC.fullAddress(site)) +
+        '</div>' +
+        '<p class="hint mt-1 mb-0">This form is to be signed by <u>all</u> people conducting SYEP/WLG business. ' +
+          'All worksites must be monitored and visits documented in YEPS.</p></div>' +
+        (log.length
+          ? '<div class="tbl-wrap"><table class="tbl"><thead><tr>' +
+            '<th>Date</th><th>Name of Monitor</th><th>Reason for Visit</th>' +
+            '<th>Time In</th><th>Time Out</th><th>Duration</th><th>Notes</th><th></th>' +
+            '</tr></thead><tbody>' +
+            log.map(function (l) {
+              return '<tr>' +
+                '<td class="nowrap strong">' + esc(GRYC.fmtSlash(l.date)) + '</td>' +
+                '<td class="nowrap">' + esc(l.monitor) + '</td>' +
+                '<td class="small">' + esc(reasonLabel(l)) + '</td>' +
+                '<td class="nowrap">' + esc(GRYC.fmtTime(l.timeIn)) + '</td>' +
+                '<td class="nowrap">' + (l.timeOut ? esc(GRYC.fmtTime(l.timeOut))
+                  : '<span class="badge warn">On site</span>') + '</td>' +
+                '<td class="nowrap muted">' + esc(dur(l)) + '</td>' +
+                '<td class="small muted">' + esc(l.notes || '—') + '</td>' +
+                '<td class="right no-print"><button class="btn sm ghost danger" data-dellog="' +
+                  esc(l.id) + '">Remove</button></td>' +
+              '</tr>';
+            }).join('') + '</tbody></table></div>'
+          : '<div class="empty"><div class="big">🕘</div><p class="strong">No visits logged yet</p>' +
+            '<p class="muted">Use the Check in button at the top of the page when you arrive.</p></div>') +
+        (primary
+          ? '<div class="card-f small muted">Worksite supervisor of record: <strong>' + esc(primary.name) +
+            '</strong>' + (primary.title ? ' · ' + esc(primary.title) : '') + '</div>'
+          : '') +
+      '</div>';
+
+    $('#printlog').addEventListener('click', function () { window.print(); });
+    $$('[data-dellog]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        GRYC.confirmBox('Remove log entry?', 'This visit will be deleted from the monitoring log.', 'Remove',
+          function () {
+            site.log = site.log.filter(function (l) { return l.id !== b.dataset.dellog; });
+            GRYC.save(); GRYC.toast('Entry removed.'); renderHead(); paint();
+          });
+      });
+    });
+
+    $('#manualentry').addEventListener('click', function () {
+      GRYC.modal({
+        title: 'Add a log entry', okText: 'Add entry',
+        body:
+          '<div class="grid c3">' +
+            '<div class="field"><label>Date</label><input type="date" id="m_date" value="' + GRYC.todayISO() + '"></div>' +
+            '<div class="field"><label>Time In</label>' + GRYC.timeSelect('id="m_in"', '11:45', { blank: false }) + '</div>' +
+            '<div class="field"><label>Time Out</label>' + GRYC.timeSelect('id="m_out"', '12:00', { blank: false }) + '</div>' +
+          '</div>' +
+          '<div class="field"><label class="req">Reason for Visit <span class="muted">(check all applicable)</span></label>' +
+            reasonsHTML(['monitoring'], '') + '</div>' +
+          '<div class="field mb-0"><label>Notes</label><textarea id="m_notes" rows="2"></textarea></div>',
+        onOk: function (r) {
+          var reasons = readReasons(r);
+          if (!reasons.length) { GRYC.toast('Pick at least one reason.', 'bad'); return false; }
+          var tin = GRYC.$('#m_in', r).value, tout = GRYC.$('#m_out', r).value;
+          if (GRYC.minutes(tout) <= GRYC.minutes(tin)) {
+            GRYC.toast('Time out has to be after time in.', 'bad'); return false;
+          }
+          site.log.unshift({
+            id: GRYC.uid('lg'),
+            date: GRYC.$('#m_date', r).value,
+            timeIn: tin, timeOut: tout,
+            monitor: user.name,
+            reasons: reasons,
+            otherText: GRYC.$('#ci_other', r).value.trim(),
+            notes: GRYC.$('#m_notes', r).value.trim()
+          });
+          GRYC.save(); GRYC.toast('Log entry added.', 'ok'); renderHead(); paint();
+        }
+      });
+      wireReasons(document);
+    });
+  }
+
+  function dur(l) {
+    if (!l.timeOut) return '—';
+    var d = GRYC.minutes(l.timeOut) - GRYC.minutes(l.timeIn);
+    if (d < 0) return '—';
+    return (d >= 60 ? Math.floor(d / 60) + 'h ' : '') + (d % 60) + 'm';
+  }
+
+  /* ================= weekly ================= */
+
+  function paneWeekly() {
+    var w = GRYC.week(selWeek);
+    var d = GRYC.weekData(site, selWeek);
+    var a = d.assessment;
+    var ts = d.timesheets;
+
+    var strip = GRYC.WEEKS.map(function (x) {
+      var wd = site.weeks[x.n];
+      var done = wd && wd.assessment && wd.assessment.status === 'submitted';
+      var draft = wd && wd.assessment && wd.assessment.status === 'draft';
+      var cls = 'wk' + (x.n === selWeek ? ' on' : '') + (x.n === cw && x.n !== selWeek ? ' cur' : '');
+      var state = x.n > cw ? '<span class="muted">Upcoming</span>'
+        : done ? '<span style="color:var(--ok)">✓ Filed</span>'
+        : draft ? '<span style="color:var(--warn)">Draft</span>'
+        : '<span style="color:var(--bad)">Due</span>';
+      return '<div class="' + cls + '" data-week="' + x.n + '">' +
+        '<div class="n">Week ' + x.n + '</div>' +
+        '<div class="d">' + esc(GRYC.fmtShort(x.start)) + '</div>' +
+        '<div class="s">' + state + '</div></div>';
+    }).join('');
+
+    var evalWeek = (selWeek === 3 || selWeek === 6);
+    var evalKey = selWeek === 3 ? 'week3' : 'week6';
+    var evalDone = evalWeek ? active().filter(function (p) { return p.docs[evalKey]; }).length : 0;
+    var flags = a ? GRYC.findings(a, site) : [];
+
+    $('#pane').innerHTML =
+      '<div class="weeks mb-3">' + strip + '</div>' +
+
+      '<div class="row between wrap-row mb-2">' +
+        '<h2>Week ' + selWeek + ' <span class="muted" style="font-weight:400">· ' +
+          esc(GRYC.fmtShort(w.start)) + ' – ' + esc(GRYC.fmtDate(w.end)) +
+          ' · week ending ' + esc(GRYC.fmtSlash(w.ending)) + '</span></h2>' +
+        (selWeek === cw ? '<span class="badge info">Current week</span>' : '') +
+      '</div>' +
+
+      '<div class="grid c2">' +
+
+        /* ---- timesheets ---- */
+        '<div class="card"><div class="card-h"><h2>Weekly Timesheets</h2><div class="spacer"></div>' +
+          (ts.status === 'collected'
+            ? '<span class="badge ok"><span class="dot"></span>All in</span>'
+            : ts.status === 'partial'
+              ? '<span class="badge warn"><span class="dot"></span>' + ts.received + ' of ' + ts.expected + '</span>'
+              : '<span class="badge bad"><span class="dot"></span>Outstanding</span>') +
+        '</div><div class="card-b">' +
+          '<div class="row between small" style="margin-bottom:6px">' +
+            '<span class="muted">Sheets received</span>' +
+            '<span class="strong">' + ts.received + ' / ' + ts.expected + '</span></div>' +
+          '<div class="meter mb-2"><i style="width:' +
+            (ts.expected ? Math.round(ts.received / ts.expected * 100) : 0) + '%;background:' +
+            (ts.received >= ts.expected && ts.expected ? 'var(--green)' : 'var(--yellow)') + '"></i></div>' +
+          (ts.collectedOn ? kv('Picked up', GRYC.fmtDate(ts.collectedOn)) : '') +
+          (ts.note ? '<div class="lbl mt-1">Note</div><p class="small">' + esc(ts.note) + '</p>' : '') +
+          '<div class="row mt-2">' +
+            '<button class="btn' + (tsOpen ? '' : ' primary') + '" id="tstoggle">' +
+              (tsOpen ? 'Hide list' : 'Check off timesheets') + '</button>' +
+            '<button class="btn sm ghost" id="edits">Pickup details</button>' +
+          '</div>' +
+          '<div class="hint mt-2 mb-0">Week ending ' + esc(GRYC.fmtSlash(w.ending)) + ' · ' +
+            esc(GRYC.PROGRAM.serviceOption) + ' · max ' + GRYC.PROGRAM.maxWeeklyHours + ' hrs/participant</div>' +
+        '</div></div>' +
+
+        /* ---- assessment ---- */
+        '<div class="card"><div class="card-h"><h2>Worksite Assessment Report</h2><div class="spacer"></div>' +
+          (a && a.status === 'submitted' ? '<span class="badge ok"><span class="dot"></span>Filed</span>'
+            : a ? '<span class="badge warn"><span class="dot"></span>Draft</span>'
+            : '<span class="badge bad"><span class="dot"></span>Not started</span>') +
+        '</div><div class="card-b">' +
+          (a && a.status === 'submitted'
+            ? '<div class="grid c2 mb-2">' +
+                kv('Visit date', GRYC.fmtDate(a.visitDate)) +
+                kv('Present', a.present + ' of ' + a.assigned) +
+                kv('Interviews', (a.interviews || []).filter(function (i) { return i.lastName; }).length +
+                  ' of ' + GRYC.INTERVIEWS_REQUIRED) +
+              '</div>' +
+              (flags.length
+                ? '<div class="badge bad mb-2">' + flags.length + ' item(s) flagged</div>'
+                : '<div class="badge ok mb-2">No findings</div>') +
+              '<div class="row"><a class="btn" href="assessment.html?site=' + esc(site.id) + '&week=' + selWeek +
+                '&view=1">View / print</a>' +
+              '<a class="btn ghost" href="assessment.html?site=' + esc(site.id) + '&week=' + selWeek + '">Edit</a></div>'
+            : '<p class="muted">' + (a ? 'A draft is saved. Pick up where you left off.'
+                : 'Six pages: site &amp; facility, recordkeeping, attendance, operations, program activities' +
+                  (site.childcare ? ', childcare questions' : '') + ', two participant interviews, ' +
+                  'summary and signatures.') + '</p>' +
+              '<a class="btn primary" href="assessment.html?site=' + esc(site.id) + '&week=' + selWeek + '">' +
+                (a ? 'Continue draft' : 'Start assessment') + '</a>') +
+        '</div></div>' +
+
+      '</div>' +
+
+      /* ---- per-participant timesheet check-off ---- */
+      (tsOpen
+        ? '<div class="card mt-2"><div class="card-h"><h2>Timesheet check-off</h2>' +
+            '<div class="spacer"></div>' +
+            '<button class="btn sm" id="tsall">Tick all</button>' +
+            '<button class="btn sm ghost" id="tsnone">Clear</button></div>' +
+          '<div class="card-b tight"><p class="hint mb-0">Tick each participant as their signed sheet ' +
+            'comes in. Week ending ' + esc(GRYC.fmtSlash(w.ending)) + '.</p></div>' +
+          (active().length
+            ? '<div class="tbl-wrap scroll-y"><table class="tbl"><thead><tr>' +
+              '<th class="chk">Sheet in</th><th>Participant</th><th>Application ID</th>' +
+              '<th>Schedule</th><th class="right">Signed by</th></tr></thead><tbody>' +
+              active().map(function (p) {
+                var on = !!(ts.collected && ts.collected[p.id]);
+                return '<tr' + (on ? ' class="row-on"' : '') + '>' +
+                  '<td class="chk"><input type="checkbox" data-ts="' + esc(p.id) + '"' +
+                    (on ? ' checked' : '') + '></td>' +
+                  '<td class="strong">' + esc(GRYC.proster(p)) +
+                    (p.note ? ' <span class="note-dot" title="' + esc(p.note) + '">●</span>' : '') + '</td>' +
+                  '<td class="mono small">' + esc(p.appId || '—') + '</td>' +
+                  '<td class="tiny muted">' + esc(scheduleFor(p)) + '</td>' +
+                  '<td class="right tiny muted">' + esc(signerName()) + '</td></tr>';
+              }).join('') + '</tbody></table></div>'
+            : '<div class="empty"><p class="muted mb-0">No active participants on this roster.</p></div>') +
+          '<div class="card-f small muted">' + ts.received + ' of ' + ts.expected +
+            ' collected. The supervisor verifies hours before signing each sheet.</div>' +
+        '</div>'
+        : '') +
+
+      /* Evaluations are handed out and collected on paper, so there is nothing
+         to fill in here — just the count, and a way back to the tick boxes. */
+      (evalWeek
+        ? '<div class="card mt-2"><div class="card-h"><h2>Week ' + selWeek + ' Participant Evaluations</h2>' +
+            '<div class="spacer"></div><span class="badge' +
+            (evalDone === active().length ? ' ok' : ' warn') + '">' +
+            evalDone + ' of ' + active().length + ' back</span></div>' +
+          '<div class="card-b">' +
+            '<p class="muted mb-2">Paper forms, handed to the supervisor ahead of week ' + selWeek +
+              '. Tick each one off on the roster as the signed copy comes back.</p>' +
+            '<a class="btn" href="site.html?id=' + esc(site.id) + '&tab=participants">Open the roster</a>' +
+          '</div></div>'
+        : '');
+
+    $$('.wk').forEach(function (el) {
+      el.addEventListener('click', function () {
+        selWeek = +el.dataset.week;
+        history.replaceState(null, '', 'site.html?id=' + site.id + '&tab=weekly&week=' + selWeek);
+        paint();
+      });
+    });
+
+    $('#tstoggle').addEventListener('click', function () { tsOpen = !tsOpen; paint(); });
+
+    $$('[data-ts]').forEach(function (cb) {
+      cb.addEventListener('change', function () {
+        ts.collected = ts.collected || {};
+        if (cb.checked) ts.collected[cb.dataset.ts] = true;
+        else delete ts.collected[cb.dataset.ts];
+        if (cb.checked && !ts.collectedOn) ts.collectedOn = GRYC.todayISO();
+        GRYC.syncTimesheets(site, ts);
+        GRYC.save();
+        paint();
+      });
+    });
+
+    if ($('#tsall')) {
+      $('#tsall').addEventListener('click', function () {
+        ts.collected = {};
+        active().forEach(function (p) { ts.collected[p.id] = true; });
+        ts.collectedOn = ts.collectedOn || GRYC.todayISO();
+        GRYC.syncTimesheets(site, ts); GRYC.save();
+        GRYC.toast('All ' + ts.expected + ' sheets marked in.', 'ok'); paint();
+      });
+      $('#tsnone').addEventListener('click', function () {
+        ts.collected = {};
+        GRYC.syncTimesheets(site, ts); GRYC.save(); paint();
+      });
+    }
+
+    $('#edits').addEventListener('click', function () {
+      GRYC.modal({
+        title: 'Week ' + selWeek + ' timesheet pickup', okText: 'Save',
+        body:
+          '<div class="field"><label>Date collected</label><input type="date" id="t_date" value="' +
+            esc(ts.collectedOn || GRYC.todayISO()) + '"></div>' +
+          '<div class="field mb-0"><label>Note (missing sheets, unsigned, etc.)</label>' +
+            '<textarea id="t_note" rows="3">' + esc(ts.note || '') + '</textarea>' +
+            '<div class="hint">The count comes from the check-off list, so it always matches ' +
+              'what you actually have in hand.</div></div>',
+        onOk: function (r) {
+          ts.collectedOn = GRYC.$('#t_date', r).value;
+          ts.note = GRYC.$('#t_note', r).value.trim();
+          GRYC.syncTimesheets(site, ts);
+          GRYC.save(); GRYC.toast('Saved.', 'ok'); paint();
+        }
+      });
+    });
+  }
+
+  /* Which shift a participant is on isn't tracked per-person yet, so show the
+     site's schedule when there is only one. */
+  function scheduleFor() {
+    if (site.schedules.length === 1) return site.schedules[0].mon || '—';
+    return site.staggered === 'Yes' ? 'Staggered' : '—';
+  }
+
+  function signerName() {
+    var v = GRYC.primarySupervisor(site);
+    return v ? v.name : '—';
+  }
+
+  renderHead();
+  paint();
+})();
+</script>
+</body>
+</html>

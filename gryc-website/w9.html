@@ -1,0 +1,951 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Form W-9 · GRYC SYEP Site Monitor Portal</title>
+<link rel="icon" href="assets/images/gryc_logo.png">
+<link rel="stylesheet" href="assets/styles.css?v=15">
+</head>
+<body>
+
+<main class="page"><div class="wrap"><div class="formwrap">
+  <div class="crumb no-print" id="crumb"></div>
+  <div id="root"></div>
+</div></div></main>
+
+<script src="assets/data.js?v=15"></script>
+<script src="assets/app.js?v=15"></script>
+<script>
+/* ==========================================================================
+   Form W-9 — Request for Taxpayer Identification Number and Certification
+
+   The payee answers plain questions over two steps. The third lays those
+   answers out on the IRS form for them to check and ends with Part II and
+   the signature. The page is built around the IRS rules for taking W-9s
+   electronically (Announcement 98-27, repeated in the Instructions for the
+   Requester of Form W-9):
+
+     · the same information as the paper form — every line, in the IRS's
+       own words (the strings live in assets/data.js);
+     · the perjury statement word for word, immediately before the
+       signature, with the payee told that signing makes the declaration;
+     · the signature as the final entry — signing submits, and a signed
+       W-9 is never edited;
+     · a log of every access that led to the submission, a fingerprint that
+       shows the form has not changed since it was signed, and a hard copy
+       that prints on request.
+   ========================================================================== */
+(function () {
+  var $ = GRYC.$, $$ = GRYC.$$, esc = GRYC.esc;
+  var user = GRYC.requireAuth();
+  if (!user) return;
+  GRYC.renderHeader('sites');
+
+  $('#crumb').innerHTML = '<a href="dashboard.html">My Sites</a> <span class="muted">/</span> Form W-9';
+
+  var id = GRYC.param('id');
+  var rec = id ? GRYC.w9(id) : null;
+  if (rec && rec.monitorId !== user.id) rec = null;   /* TINs are not for every account */
+  if (id && !rec) {
+    $('#root').innerHTML = '<div class="card"><div class="empty"><p>That W-9 was not found.</p>' +
+      '<a class="btn" href="dashboard.html">Back</a></div></div>';
+    return;
+  }
+
+  var STEPS = [
+    { label: 'Name & classification', page: 'Lines 1–4' },
+    { label: 'Address & TIN',         page: 'Lines 5–7 · Part I' },
+    { label: 'Review & sign',         page: 'Part II' }
+  ];
+  /* Classifications whose TIN is normally an EIN, so the TIN step starts on
+     the right box. Individuals start on the SSN. */
+  var USES_EIN = { ccorp: 1, scorp: 1, partnership: 1, trust: 1, llc: 1, other: 1 };
+
+  var step = 1;
+  var sig = null, sigOpts = null;
+
+  /* ======================================================================
+     working copy
+     ====================================================================== */
+
+  function blank() {
+    return {
+      id: GRYC.uid('w9'), monitorId: user.id, status: 'draft',
+      form: GRYC.W9_REV,
+      requester: JSON.parse(JSON.stringify(GRYC.W9_REQUESTER)),
+
+      /* lines 1–4 */
+      name: '', business: '',
+      taxClass: '', llcCode: '', otherText: '', foreignPartners: false,
+      exemptPayee: '', fatca: '',
+
+      /* lines 5–7 */
+      address: '', city: '', state: 'NY', zip: '', accounts: '',
+
+      /* Part I — digits only */
+      tinType: 'ssn', tin: '', appliedFor: false,
+
+      /* Part II */
+      backupWithholding: false,
+      identity: '', signerName: '', signerTitle: '',
+      signature: '', signedAt: '', signedDate: '',
+      collectedBy: null, device: '', hash: '',
+
+      createdAt: '', updatedAt: '',
+      audit: []
+    };
+  }
+
+  var saved = !!rec;
+  var form = rec ? JSON.parse(JSON.stringify(rec)) : blank();
+
+  /* A draft may predate a field. A signed W-9 is left exactly as signed. */
+  if (form.status !== 'signed') {
+    (function backfillForm() {
+      var b = blank();
+      Object.keys(b).forEach(function (k) { if (form[k] === undefined) form[k] = b[k]; });
+    })();
+  }
+
+  /* Every load is an occasion of access, so every load goes in the log. */
+  if (saved) {
+    GRYC.logAccess(form, form.status === 'signed' ? 'Viewed' : 'Opened the draft');
+    GRYC.putW9(form);
+  }
+
+  /* The first save creates the record and starts its log. */
+  function persist(what, detail) {
+    var now = new Date().toISOString();
+    if (!saved) {
+      form.createdAt = now;
+      GRYC.logAccess(form, 'Started', 'New W-9 for ' + form.requester.name);
+      saved = true;
+      history.replaceState(null, '', 'w9.html?id=' + form.id);
+    }
+    if (what) GRYC.logAccess(form, what, detail);
+    form.updatedAt = now;
+    GRYC.putW9(form);
+  }
+
+  function touched() {
+    return !!(form.name || form.business || form.taxClass || form.address || form.city || form.zip || form.tin);
+  }
+
+  function isIndividual() { return form.taxClass === 'individual'; }
+
+  /* Line 3b only exists for these, and only matters when the form is going
+     to a partnership, trust, or estate the payee has an interest in. */
+  function has3b() {
+    return form.taxClass === 'partnership' || form.taxClass === 'trust' ||
+      (form.taxClass === 'llc' && form.llcCode === 'P');
+  }
+
+  /* ======================================================================
+     helpers
+     ====================================================================== */
+
+  function norm(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); }
+
+  /* 2026-09-11 -> 09/11/2026, the way a W-9 is dated. */
+  function fmtW9Date(iso) {
+    if (!iso) return '';
+    var p = iso.split('-');
+    return p[1] + '/' + p[2] + '/' + p[0];
+  }
+
+  function stamp(iso) {
+    if (!iso) return '—';
+    return new Date(iso).toLocaleString('en-US', {
+      month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit'
+    });
+  }
+
+  /* The number as it is being typed: 123-45-6789 or 12-3456789. */
+  function fmtTyping(d, type) {
+    d = String(d || '');
+    if (type === 'ein') return d.length > 2 ? d.slice(0, 2) + '-' + d.slice(2) : d;
+    if (d.length > 5) return d.slice(0, 3) + '-' + d.slice(3, 5) + '-' + d.slice(5);
+    if (d.length > 3) return d.slice(0, 3) + '-' + d.slice(3);
+    return d;
+  }
+
+  /* Structural checks only. An ITIN starts with 9 and goes in the SSN boxes,
+     so a leading 9 is allowed. */
+  function tinProblem(d, type) {
+    if (!d) return 'is required (or tick “I’ve applied for it”)';
+    if (d.length !== 9) return 'must be 9 digits';
+    if (type === 'ein') return d.slice(0, 2) === '00' ? 'can’t start with 00' : '';
+    if (/^(000|666)/.test(d)) return 'can’t start with 000 or 666';
+    if (d.slice(3, 5) === '00') return 'can’t have 00 as its middle two digits';
+    if (d.slice(5) === '0000') return 'can’t end in 0000';
+    return '';
+  }
+
+  function identityText(f) {
+    var by = f.collectedBy || { name: user.name, email: user.email };
+    if (f.identity === 'self') return 'Signed by the account holder, signed in as ' + by.email;
+    if (f.identity === 'inperson') return 'Signed in person; photo ID checked by ' + by.name;
+    return '—';
+  }
+
+  function signerLine(f) { return f.signerName + (f.signerTitle ? ', ' + f.signerTitle : ''); }
+
+  /* `last` drops the gap under the final card of a step. */
+  function card(title, tag, inner, last) {
+    return '<div class="card' + (last ? '' : ' mb-2') + '"><div class="card-h"><h2>' + esc(title) + '</h2>' +
+      '<div class="spacer"></div><span class="badge">' + esc(tag) + '</span></div>' +
+      '<div class="card-b">' + inner + '</div></div>';
+  }
+
+  /* `label` and `o.hint` are markup written in this file; values are escaped. */
+  function field(id, label, value, o) {
+    o = o || {};
+    return '<div class="field' + (o.mb0 ? ' mb-0' : '') + '">' +
+      '<label for="' + id + '"' + (o.req ? ' class="req"' : '') + '>' + label + '</label>' +
+      '<input type="text" id="' + id + '" value="' + esc(value || '') + '"' + (o.attrs || '') + '>' +
+      (o.hint ? '<div class="hint">' + o.hint + '</div>' : '') + '</div>';
+  }
+
+  /* ======================================================================
+     THE FORM — page 1 of Form W-9, line for line
+
+     Labels are the IRS wording; the answers sit where a pen would put
+     them. Used for the review before signing (without Part II, which the
+     payee signs on its own card) and for the signed copy.
+     ====================================================================== */
+
+  function certHTML(f) {
+    return '<p class="w9-ci">' + esc(GRYC.W9_CERT_INTRO) + '</p>' +
+      '<ol class="w9-certs">' + GRYC.W9_CERT.map(function (t, i) {
+        return '<li data-cert="' + (i + 1) + '"' + (i === 1 && f.backupWithholding ? ' class="x"' : '') + '>' +
+          (i + 1) + '. ' + esc(t) + '</li>';
+      }).join('') + '</ol>' +
+      '<p class="w9-cinst"><b>Certification instructions.</b> ' + esc(GRYC.W9_CERT_INSTRUCTIONS) + '</p>';
+  }
+
+  function w9Doc(f, o) {
+    o = o || {};
+    var box = GRYC.box, req = f.requester || GRYC.W9_REQUESTER, ein = f.tinType === 'ein';
+
+    function lab(n, t) { return '<div class="lab">' + (n ? '<b class="ln">' + n + '</b>' : '') + t + '</div>'; }
+    function val(v) { return '<div class="val">' + (v ? esc(v) : '&nbsp;') + '</div>'; }
+
+    /* Masked and full copies of the digits sit side by side; the page
+       shows one, print always shows the full number. */
+    function tinCells(mine, groups) {
+      if (mine && f.appliedFor) return '<div class="w9-applied">Applied For</div>';
+      var d = mine ? String(f.tin || '') : '';
+      function cells(mask) {
+        var i = 0;
+        return groups.map(function (g, gi) {
+          var s = '';
+          for (var k = 0; k < g; k++, i++) {
+            var ch = d.charAt(i);
+            if (mask && ch && i < d.length - 4) ch = '•';
+            s += '<i>' + esc(ch) + '</i>';
+          }
+          return (gi ? '<span class="dash">–</span>' : '') + '<span class="g">' + s + '</span>';
+        }).join('');
+      }
+      if (!d) return '<div class="tin">' + cells(false) + '</div>';
+      return '<div class="tin tin-mask">' + cells(true) + '</div><div class="tin tin-full">' + cells(false) + '</div>';
+    }
+
+    var fiveBoxes = GRYC.W9_CLASSES.filter(function (c) { return c.id !== 'llc' && c.id !== 'other'; })
+      .map(function (c) { return '<span class="w9-cb">' + box(f.taxClass === c.id) + ' ' + esc(c.label) + '</span>'; })
+      .join('');
+
+    var cityLine = [f.city, [f.state, f.zip].filter(Boolean).join(' ')].filter(Boolean).join(', ');
+
+    return '' +
+      '<div class="w9-head">' +
+        '<div class="w9-id"><span class="f">Form</span> <span class="n">W-9</span>' +
+          '<span class="r">(' + esc(f.form || GRYC.W9_REV) + ')</span>' +
+          '<span class="d">Department of the Treasury<br>Internal Revenue Service</span></div>' +
+        '<div class="w9-title"><b>Request for Taxpayer<br>Identification Number and Certification</b>' +
+          '<span>Go to <i>www.irs.gov/FormW9</i> for instructions and the latest information.</span></div>' +
+        '<div class="w9-give">Give form to the requester. Do not send to the IRS.</div>' +
+      '</div>' +
+      '<div class="w9-begin"><b>Before you begin.</b> For guidance related to the purpose of Form W-9, ' +
+        'see <i>Purpose of Form</i>, below.</div>' +
+
+      '<div class="w9-body">' +
+        '<div class="w9-rail">Print or type. See <b>Specific Instructions</b> on page 3.</div>' +
+        '<div class="w9-lines">' +
+          '<div class="w9-l">' + lab('1', 'Name of entity/individual. An entry is required. (For a sole proprietor or ' +
+            'disregarded entity, enter the owner’s name on line 1, and enter the business/disregarded entity’s ' +
+            'name on line 2.)') + val(f.name) + '</div>' +
+          '<div class="w9-l">' + lab('2', 'Business name/disregarded entity name, if different from above.') +
+            val(f.business) + '</div>' +
+
+          '<div class="w9-mid">' +
+            '<div class="w9-3">' +
+              lab('3a', 'Check the appropriate box for federal tax classification of the entity/individual whose ' +
+                'name is entered on line 1. Check <b>only one</b> of the following seven boxes.') +
+              '<div class="w9-cbs">' + fiveBoxes + '</div>' +
+              '<div class="w9-cbline">' + box(f.taxClass === 'llc') + ' LLC. Enter the tax classification ' +
+                '(C = C corporation, S = S corporation, P = Partnership) ▶ ' +
+                '<span class="w9-code">' + esc(f.llcCode || '') + '</span></div>' +
+              '<div class="w9-note"><b>Note:</b> Check the “LLC” box above and, in the entry space, enter the ' +
+                'appropriate code (C, S, or P) for the tax classification of the LLC, unless it is a disregarded ' +
+                'entity. A disregarded entity should instead check the appropriate box for the tax classification ' +
+                'of its owner.</div>' +
+              '<div class="w9-cbline">' + box(f.taxClass === 'other') + ' Other (see instructions) ▶ ' +
+                '<span class="w9-fill">' + esc(f.otherText || '') + '</span></div>' +
+              '<div class="w9-3b">' + lab('3b', 'If on line 3a you checked “Partnership” or “Trust/estate,” or ' +
+                'checked “LLC” and entered “P” as its tax classification, and you are providing this form to a ' +
+                'partnership, trust, or estate in which you have an ownership interest, check this box if you have ' +
+                'any foreign partners, owners, or beneficiaries. See instructions') + box(f.foreignPartners) + '</div>' +
+            '</div>' +
+            '<div class="w9-4">' +
+              lab('4', 'Exemptions (codes apply only to certain entities, not individuals; see instructions on page 3):') +
+              '<div class="w9-ex">Exempt payee code (if any) <span class="w9-code">' + esc(f.exemptPayee || '') + '</span></div>' +
+              '<div class="w9-ex">Exemption from Foreign Account Tax Compliance Act (FATCA) reporting code (if any) ' +
+                '<span class="w9-code">' + esc(f.fatca || '') + '</span></div>' +
+              '<div class="w9-ex"><i>(Applies to accounts maintained outside the United States.)</i></div>' +
+            '</div>' +
+          '</div>' +
+
+          '<div class="w9-addr">' +
+            '<div class="w9-56">' +
+              '<div class="w9-l">' + lab('5', 'Address (number, street, and apt. or suite no.). See instructions.') +
+                val(f.address) + '</div>' +
+              '<div class="w9-l">' + lab('6', 'City, state, and ZIP code') + val(cityLine) + '</div>' +
+            '</div>' +
+            '<div class="w9-req">' + lab('', 'Requester’s name and address (optional)') +
+              '<div class="val">' + esc(req.name) + '<br>' + esc(req.address) + '<br>' + esc(req.city) + '</div></div>' +
+          '</div>' +
+          '<div class="w9-l">' + lab('7', 'List account number(s) here (optional)') + val(f.accounts) + '</div>' +
+        '</div>' +
+      '</div>' +
+
+      '<div class="w9-part"><span class="pn">Part I</span><b>Taxpayer Identification Number (TIN)</b></div>' +
+      '<div class="w9-p1">' +
+        '<div class="w9-p1t">Enter your TIN in the appropriate box. The TIN provided must match the name given on ' +
+          'line 1 to avoid backup withholding. For individuals, this is generally your social security number (SSN). ' +
+          'However, for a resident alien, sole proprietor, or disregarded entity, see the instructions for Part I, ' +
+          'later. For other entities, it is your employer identification number (EIN). If you do not have a number, ' +
+          'see <i>How to get a TIN</i>, later.' +
+          '<p><b>Note:</b> If the account is in more than one name, see the instructions for line 1. See also ' +
+          '<i>What Name and Number To Give the Requester</i> for guidelines on whose number to enter.</p></div>' +
+        '<div class="w9-tins">' +
+          '<div class="w9-tinbox"><div class="tl">Social security number</div>' + tinCells(!ein, [3, 2, 4]) + '</div>' +
+          '<div class="w9-or">or</div>' +
+          '<div class="w9-tinbox"><div class="tl">Employer identification number</div>' + tinCells(ein, [2, 7]) + '</div>' +
+        '</div>' +
+      '</div>' +
+
+      (o.part2 === false ? '' :
+        '<div class="w9-part"><span class="pn">Part II</span><b>Certification</b></div>' +
+        '<div class="w9-p2">' + certHTML(f) + '</div>' +
+        '<div class="w9-sign">' +
+          '<div class="sh">Sign<br>Here</div>' +
+          '<div class="sg"><span class="sl">Signature of<br>U.S. person</span>' +
+            '<span class="sv">' + (f.signature ? GRYC.sigView(f.signature) : '') + '</span></div>' +
+          '<div class="sd"><span class="sl">Date</span><span class="sv">' + esc(fmtW9Date(f.signedDate)) + '</span></div>' +
+        '</div>') +
+
+      '<div class="w9-foot"><span></span><span><b>Form W-9</b> (' + esc(f.form || GRYC.W9_REV) + ')</span></div>';
+  }
+
+  /* ======================================================================
+     WIZARD
+     ====================================================================== */
+
+  function renderWizard() {
+    $('#root').innerHTML =
+      '<div class="row between wrap-row mb-3">' +
+        '<div><h1>Form W-9</h1>' +
+        '<p class="muted mb-0">Request for Taxpayer Identification Number and Certification · ' +
+          esc(form.form) + ' · requested by ' + esc(form.requester.name) + '</p></div>' +
+        '<div class="row">' +
+          '<button class="btn ghost danger" id="delete">Delete draft</button>' +
+          '<button class="btn" id="savedraft">Save draft</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="steps" id="steps"></div>' +
+      '<div id="stepbody"></div>' +
+      '<div class="row between mt-3">' +
+        '<button class="btn" id="prev">← Cancel</button>' +
+        '<div class="row"><span class="tiny muted" id="stepcount"></span>' +
+        '<button class="btn primary" id="next">Continue →</button></div>' +
+      '</div>';
+
+    $('#savedraft').addEventListener('click', function () {
+      collect();
+      if (!saved && !touched()) { GRYC.toast('Nothing to save yet.', 'bad'); return; }
+      persist('Saved the draft');
+      GRYC.toast('Draft saved.', 'ok');
+      setTimeout(function () { location.href = 'dashboard.html'; }, 600);
+    });
+    $('#delete').addEventListener('click', function () {
+      GRYC.confirmBox('Delete this draft?',
+        'The answers on this W-9 are thrown away. It was never signed, so nothing leaves the record.',
+        'Delete draft', function () { GRYC.removeW9(form.id); location.href = 'dashboard.html'; });
+    });
+    $('#prev').addEventListener('click', function () {
+      collect();
+      if (step > 1) go(step - 1);
+      else location.href = 'dashboard.html';
+    });
+    $('#next').addEventListener('click', function () {
+      collect();
+      var miss = problems(step);
+      if (miss.length) { notReady(miss, false); return; }
+      go(step + 1);
+    });
+
+    paintStep();
+  }
+
+  function go(n) {
+    if (saved || touched()) persist();
+    step = n;
+    paintStep();
+  }
+
+  function paintStep() {
+    $('#steps').innerHTML = STEPS.map(function (s, i) {
+      var n = i + 1;
+      return '<div class="st ' + (n === step ? 'on' : n < step ? 'done' : '') + '" data-step="' + n + '">' +
+        '<div class="num">' + (n < step ? '✓' : n) + '</div>' +
+        '<div class="lb">' + esc(s.label) + '<span class="pg">' + esc(s.page) + '</span></div></div>';
+    }).join('');
+    $$('#steps .st').forEach(function (el) {
+      el.addEventListener('click', function () { collect(); go(+el.dataset.step); });
+    });
+
+    $('#stepcount').textContent = 'Step ' + step + ' of ' + STEPS.length;
+    $('#prev').textContent = step === 1 ? '← Cancel' : '← Back';
+    /* The last step submits from the signature itself, so nothing sits
+       between the signature and the submission. */
+    $('#next').classList.toggle('hidden', step === STEPS.length);
+    $('#delete').classList.toggle('hidden', !saved);
+
+    sig = null;
+    if (step === 1) stepOne();
+    else if (step === 2) stepTwo();
+    else stepThree();
+    window.scrollTo(0, 0);
+  }
+
+  /* ---- step 1: lines 1–4 ---------------------------------------------- */
+
+  function stepOne() {
+    var cls = form.taxClass;
+
+    $('#stepbody').innerHTML =
+      card('Name', 'Lines 1–2',
+        field('w_name', 'Name <span class="muted">(as shown on your income tax return)</span>', form.name, {
+          req: true, attrs: ' autocomplete="name"',
+          hint: 'A sole proprietor or single-member LLC puts the owner’s name here and the business name below.' }) +
+        field('w_business', 'Business name, if different', form.business, {
+          mb0: true, attrs: ' autocomplete="organization"',
+          hint: 'A business, trade, or “doing business as” (DBA) name, or the name of a disregarded entity ' +
+                'such as a single-member LLC.' })) +
+
+      card('Federal tax classification', 'Line 3a',
+        '<div class="lbl req">Which one describes the person or business on line 1?</div>' +
+        '<div class="rate">' + GRYC.W9_CLASSES.map(function (c) {
+          return '<label><input type="radio" name="cls" value="' + c.id + '"' + (cls === c.id ? ' checked' : '') + '>' +
+            '<span>' + esc(c.id === 'other' ? 'Other' : c.label) + '</span></label>';
+        }).join('') + '</div>' +
+        '<div class="hint">Pick one. Someone filling this out for themselves is usually an Individual/sole proprietor.</div>' +
+
+        (cls === 'llc'
+          ? '<div class="field mt-2 mb-0"><div class="lbl req">How is the LLC taxed?</div>' +
+              '<div class="seg">' + GRYC.W9_LLC_CODES.map(function (c) {
+                return '<label><input type="radio" name="llc" value="' + c.id + '"' +
+                  (form.llcCode === c.id ? ' checked' : '') + '><span>' + c.id + ' — ' + esc(c.label) + '</span></label>';
+              }).join('') + '</div>' +
+              '<div class="callout mt-2">A single-member LLC that is <b>disregarded</b> should not pick LLC. Pick the ' +
+                'owner’s classification instead (usually Individual/sole proprietor), with the owner’s name on ' +
+                'line 1 and the LLC’s name on line 2.</div></div>'
+          : '') +
+
+        (cls === 'other'
+          ? '<div class="mt-2">' + field('w_other', 'Describe the classification', form.otherText, {
+              req: true, mb0: true, hint: 'See “Line 3a” in the W-9 instructions at irs.gov/FormW9.' }) + '</div>'
+          : '') +
+
+        (has3b()
+          ? '<label class="check mt-2' + (form.foreignPartners ? ' on' : '') + '">' +
+              '<input type="checkbox" id="w_3b"' + (form.foreignPartners ? ' checked' : '') + '>' +
+              '<span class="ct"><strong>Line 3b — I have foreign partners, owners, or beneficiaries.</strong> ' +
+              '<em>Only applies when you are giving this form to a partnership, trust, or estate in which you have an ' +
+              'ownership interest.</em></span></label>'
+          : '')) +
+
+      card('Exemptions', 'Line 4',
+        !cls
+          ? '<p class="small muted mb-0">Choose a tax classification above first.</p>'
+          : cls === 'individual'
+            ? '<p class="small muted mb-0">Exemption codes apply only to certain entities, not individuals — ' +
+              'nothing to enter here.</p>'
+            : '<div class="grid c2">' +
+                codeSelect('w_exempt', 'Exempt payee code <span class="muted">(if any)</span>',
+                  GRYC.W9_EXEMPT_PAYEE_CODES, form.exemptPayee,
+                  'Leave blank unless one of these describes you. See “Exempt payee code” in the instructions.') +
+                codeSelect('w_fatca', 'FATCA reporting exemption code <span class="muted">(if any)</span>',
+                  GRYC.W9_FATCA_CODES, form.fatca,
+                  'Applies only to accounts maintained outside the United States — usually left blank.') +
+              '</div>', true);
+
+    $$('input[name="cls"]').forEach(function (r) {
+      r.addEventListener('change', function () {
+        collect();
+        if (!form.tin) form.tinType = USES_EIN[form.taxClass] ? 'ein' : 'ssn';
+        stepOne();
+      });
+    });
+    $$('input[name="llc"]').forEach(function (r) {
+      r.addEventListener('change', function () { collect(); stepOne(); });
+    });
+    var cb = $('#w_3b');
+    if (cb) cb.addEventListener('change', function () { cb.closest('.check').classList.toggle('on', cb.checked); });
+    if (!form.name) $('#w_name').focus();
+  }
+
+  function codeSelect(id, label, codes, value, hint) {
+    return '<div class="field mb-0"><label for="' + id + '">' + label + '</label>' +
+      '<select id="' + id + '"><option value="">None</option>' + codes.map(function (c) {
+        return '<option value="' + esc(c[0]) + '"' + (value === c[0] ? ' selected' : '') + '>' +
+          esc(c[0] + ' — ' + c[1]) + '</option>';
+      }).join('') + '</select><div class="hint">' + hint + '</div></div>';
+  }
+
+  /* ---- step 2: lines 5–7 and Part I ----------------------------------- */
+
+  function tinHint() {
+    var c = form.taxClass;
+    if (c === 'individual') {
+      return 'Individuals give their SSN. A resident alien who can’t get one gives their ITIN, in the same ' +
+        'boxes. A sole proprietor with an EIN may give either — the IRS encourages the SSN.';
+    }
+    if (c === 'llc') return 'An LLC taxed as a corporation or partnership gives the LLC’s own EIN.';
+    if (c) return 'Businesses, trusts and estates give their employer identification number (EIN).';
+    return 'For individuals this is generally the SSN; for other entities, the EIN.';
+  }
+
+  function stepTwo() {
+    var ein = form.tinType === 'ein';
+
+    $('#stepbody').innerHTML =
+      card('Address', 'Lines 5–7',
+        field('w_addr', 'Address <span class="muted">(number, street, and apt. or suite no.)</span>', form.address, {
+          req: true, attrs: ' autocomplete="street-address"',
+          hint: 'Where ' + esc(form.requester.name) + ' will mail your information returns, such as a Form 1099.' }) +
+        '<div class="grid c3">' +
+          field('w_city', 'City', form.city, { req: true, attrs: ' autocomplete="address-level2"' }) +
+          '<div class="field"><label for="w_state" class="req">State</label><select id="w_state">' +
+            GRYC.US_STATES.map(function (s) {
+              return '<option' + (form.state === s ? ' selected' : '') + '>' + s + '</option>';
+            }).join('') + '</select></div>' +
+          field('w_zip', 'ZIP code', form.zip, {
+            req: true, attrs: ' inputmode="numeric" maxlength="10" autocomplete="postal-code"' }) +
+        '</div>' +
+        field('w_accts', 'Account number(s) <span class="muted">(optional)</span>', form.accounts, {
+          hint: 'Leave blank unless GRYC gave you one.' }) +
+        '<div class="lbl">Requester’s name and address</div>' +
+        '<div class="readout">' + esc(form.requester.name) + '<br>' + esc(form.requester.address) + '<br>' +
+          esc(form.requester.city) + '</div>') +
+
+      card('Taxpayer Identification Number', 'Part I',
+        '<div class="lbl req">Which number are you giving?</div>' +
+        '<div class="seg">' + [['ssn', 'Social security number'], ['ein', 'Employer identification number']]
+          .map(function (o) {
+            return '<label><input type="radio" name="tintype" value="' + o[0] + '"' +
+              (form.tinType === o[0] ? ' checked' : '') + '><span>' + o[1] + '</span></label>';
+          }).join('') + '</div>' +
+        '<div class="hint mb-2">' + tinHint() + '</div>' +
+
+        '<div class="field">' +
+          '<label for="w_tin"' + (form.appliedFor ? '' : ' class="req"') + '>' +
+            (ein ? 'Employer identification number' : 'Social security number') + '</label>' +
+          '<input type="text" id="w_tin" class="mono" inputmode="numeric" autocomplete="off" spellcheck="false" ' +
+            'placeholder="' + (ein ? '12-3456789' : '123-45-6789') + '" value="' +
+            esc(form.appliedFor ? '' : fmtTyping(form.tin, form.tinType)) + '"' + (form.appliedFor ? ' disabled' : '') + '>' +
+          '<div class="err hidden" id="tinerr"></div>' +
+          '<div class="hint">It has to match the name on line 1' +
+            (form.name ? ': <b>' + esc(form.name) + '</b>' : '') + '.</div>' +
+        '</div>' +
+
+        '<label class="check' + (form.appliedFor ? ' on' : '') + '">' +
+          '<input type="checkbox" id="w_applied"' + (form.appliedFor ? ' checked' : '') + '>' +
+          '<span class="ct"><strong>I don’t have one yet — I’ve applied for it.</strong> “Applied For” is written ' +
+          'in its place. Payments other than interest and dividends are subject to backup withholding until you ' +
+          'give ' + esc(form.requester.name) + ' the number.</span></label>' +
+
+        '<div class="callout mt-2"><strong>Demo build.</strong> This W-9 is saved in this browser only, without ' +
+          'encryption. Type a made-up number such as 123-45-6789, not a real SSN or EIN.</div>', true);
+
+    var tin = $('#w_tin');
+    tin.addEventListener('input', function () {
+      tin.value = fmtTyping(tin.value.replace(/\D/g, '').slice(0, 9), form.tinType);
+      $('#tinerr').classList.add('hidden');
+    });
+    tin.addEventListener('blur', function () {
+      var d = tin.value.replace(/\D/g, '');
+      var p = d ? tinProblem(d, form.tinType) : '';
+      $('#tinerr').textContent = p ? 'This number ' + p + '.' : '';
+      $('#tinerr').classList.toggle('hidden', !p);
+    });
+    $$('input[name="tintype"]').forEach(function (r) {
+      r.addEventListener('change', function () { collect(); stepTwo(); });
+    });
+    $('#w_applied').addEventListener('change', function () { collect(); stepTwo(); });
+  }
+
+  /* ---- step 3: review, then Part II and the signature ----------------
+     Order matters here. Announcement 98-27 wants the certifying statements,
+     then their instructions and the perjury language, then the signature,
+     with nothing in between — so who is signing and the backup-withholding
+     box are settled first, and the button that submits sits under the
+     signature. Changing anything above a signature wipes it: the signature
+     has to be the last thing put on the form.                            */
+
+  function stepThree() {
+    var indiv = isIndividual();
+    var earlier = problems(1).concat(problems(2));
+
+    $('#stepbody').innerHTML =
+      (earlier.length
+        ? '<div class="callout mb-2"><strong>Some answers are still missing.</strong> Finish them before signing:' +
+          '<ul class="mb-0" style="margin:6px 0 0;padding-left:18px">' +
+          earlier.map(function (m) { return '<li>' + esc(m) + '</li>'; }).join('') + '</ul></div>'
+        : '') +
+
+      '<p class="muted">This is the W-9 ' + esc(form.requester.name) + ' will keep. Check every line against your ' +
+        'own records — to change one, go back a step.</p>' +
+      '<div class="paper w9doc reveal mb-3">' + w9Doc(form, { part2: false }) + '</div>' +
+
+      card('Who is signing', 'Part II',
+        '<div class="lbl req">Who is signing this W-9?</div>' +
+        identOption('self', 'Me — ' + user.name,
+          'Signed in as ' + user.email + '. Pick this when the W-9 is your own' +
+          (indiv ? '.' : ', or you are signing for the business on line 1.')) +
+        identOption('inperson', 'Someone else, here in person',
+          'They sign on this device, and you have checked a photo ID that matches ' +
+          (indiv ? 'the name on line 1.' : 'the person signing.')) +
+        signerFields()) +
+
+      '<div class="card"><div class="card-h"><h2>Certification</h2><div class="spacer"></div>' +
+        '<span class="badge">Part II</span></div><div class="card-b">' +
+        '<label class="check' + (form.backupWithholding ? ' on' : '') + '">' +
+          '<input type="checkbox" id="w_bw"' + (form.backupWithholding ? ' checked' : '') + '>' +
+          '<span class="ct"><strong>Cross out item 2.</strong> The IRS has notified me that I am currently subject ' +
+          'to backup withholding because I failed to report all interest and dividends on my tax return. ' +
+          '<em>Leave this unticked unless you received that notice.</em></span></label>' +
+        '<details class="define"><summary>Who counts as a U.S. person?</summary>' +
+          '<p class="mb-1 mt-1">For federal tax purposes, you are considered a U.S. person if you are:</p>' +
+          '<ul>' + GRYC.W9_US_PERSON.map(function (t) { return '<li>' + esc(t) + '</li>'; }).join('') + '</ul>' +
+          '<p class="mb-0">A nonresident alien or foreign entity should not sign a W-9 — give the requester the ' +
+          'appropriate Form W-8 or Form 8233 instead.</p></details>' +
+
+        '<div class="attest">' + certHTML(form) + '</div>' +
+        '<p class="inform"><strong>By signing below you make the declaration above, under penalties of perjury ' +
+          '— the declaration is made by signing this Form W-9.</strong> Your signature is the final entry: signing ' +
+          'submits the form to ' + esc(form.requester.name) + ', and it can’t be changed afterward.</p>' +
+        '<div class="grid signpair">' +
+          '<div><div class="lbl req">Signature of U.S. person</div><div id="sigpad"></div></div>' +
+          '<div><div class="lbl">Date</div><div class="readout">' + esc(fmtW9Date(GRYC.todayISO())) + '</div></div>' +
+        '</div>' +
+        '<button class="btn primary lg block mt-2" id="sign">Sign and submit W-9</button>' +
+      '</div></div>';
+
+    sigOpts = { label: 'Signature of U.S. person', defaultName: form.signerName };
+    sig = GRYC.signaturePad($('#sigpad'), sigOpts);
+
+    $$('input[name="ident"]').forEach(function (r) {
+      r.addEventListener('change', function () {
+        collect();
+        /* the account holder's name is not a stranger's name */
+        if (form.identity === 'inperson' && !isIndividual() && form.signerName === user.name) form.signerName = '';
+        stepThree();
+      });
+    });
+    ['w_signer', 'w_title'].forEach(function (fid) {
+      var el = $('#' + fid);
+      if (!el) return;
+      el.addEventListener('input', function () {
+        if (fid === 'w_signer') sigOpts.defaultName = el.value.trim();
+        unsign();
+      });
+    });
+    $('#w_bw').addEventListener('change', function () {
+      var on = $('#w_bw').checked;
+      $('#w_bw').closest('.check').classList.toggle('on', on);
+      $('.attest [data-cert="2"]').classList.toggle('x', on);
+      unsign();
+    });
+    $('#sign').addEventListener('click', submit);
+  }
+
+  function identOption(value, title, sub) {
+    var on = form.identity === value;
+    return '<label class="check' + (on ? ' on' : '') + '">' +
+      '<input type="radio" name="ident" value="' + value + '"' + (on ? ' checked' : '') + '>' +
+      '<span class="ct"><strong>' + esc(title) + '</strong><br><span class="small muted">' + esc(sub) + '</span></span></label>';
+  }
+
+  function signerFields() {
+    if (!form.identity) return '';
+    if (isIndividual() || !form.taxClass) {
+      return '<div class="hint mt-1">Signs as <b>' + esc(form.name || '—') + '</b>, the person on line 1.</div>';
+    }
+    return '<div class="grid c2 mt-2">' +
+        (form.identity === 'self'
+          ? '<div class="field mb-0"><div class="lbl">Name of the person signing</div>' +
+            '<div class="readout">' + esc(user.name) + '</div></div>'
+          : field('w_signer', 'Name of the person signing', form.signerName, { req: true, mb0: true })) +
+        field('w_title', 'Title', form.signerTitle, {
+          req: true, mb0: true, attrs: ' placeholder="Owner, officer, partner…"' }) +
+      '</div>' +
+      '<div class="hint">Someone with authority to sign for ' + esc(form.name || 'the business on line 1') + '.</div>';
+  }
+
+  /* Anything changed above a signature invalidates it. */
+  function unsign() {
+    if (sig && sig.isSigned()) {
+      sig.clear();
+      GRYC.toast('Sign again — the signature has to be the last thing on the form.');
+    }
+  }
+
+  /* ---- reading the step back ------------------------------------------ */
+
+  function collect() {
+    function val(fid) { var el = $('#' + fid); return el ? el.value.trim() : null; }
+    function picked(name) {
+      if (!$('input[name="' + name + '"]')) return null;
+      var el = $('input[name="' + name + '"]:checked');
+      return el ? el.value : '';
+    }
+    function take(key, v) { if (v !== null) form[key] = v; }
+
+    take('name', val('w_name'));
+    take('business', val('w_business'));
+    take('taxClass', picked('cls'));
+    take('llcCode', picked('llc'));
+    take('otherText', val('w_other'));
+    if ($('#w_3b')) form.foreignPartners = $('#w_3b').checked;
+    take('exemptPayee', val('w_exempt'));
+    take('fatca', val('w_fatca'));
+
+    take('address', val('w_addr'));
+    take('city', val('w_city'));
+    take('state', val('w_state'));
+    take('zip', val('w_zip'));
+    take('accounts', val('w_accts'));
+    take('tinType', picked('tintype'));
+    var t = val('w_tin');
+    if (t !== null && !$('#w_tin').disabled) form.tin = t.replace(/\D/g, '').slice(0, 9);
+    if ($('#w_applied')) form.appliedFor = $('#w_applied').checked;
+
+    take('identity', picked('ident'));
+    take('signerName', val('w_signer'));
+    take('signerTitle', val('w_title'));
+    if ($('#w_bw')) form.backupWithholding = $('#w_bw').checked;
+
+    tidy();
+  }
+
+  /* Answers that stop applying are cleared, so the form never carries a box
+     the payee can no longer see. */
+  function tidy() {
+    if (form.taxClass !== 'llc') form.llcCode = '';
+    if (form.taxClass !== 'other') form.otherText = '';
+    if (!has3b()) form.foreignPartners = false;
+    if (isIndividual()) { form.exemptPayee = ''; form.fatca = ''; }
+    if (form.appliedFor) form.tin = '';
+    if (isIndividual() || !form.taxClass) { form.signerName = form.name; form.signerTitle = ''; }
+    else if (form.identity === 'self') form.signerName = user.name;
+  }
+
+  /* What is still missing on step n. `sv` is the signature, for step 3. */
+  function problems(n, sv) {
+    var out = [];
+    if (n === 1) {
+      if (!form.name) out.push('Line 1 — name (an entry is required)');
+      if (!form.taxClass) out.push('Line 3a — federal tax classification');
+      if (form.taxClass === 'llc' && !form.llcCode) out.push('Line 3a — how the LLC is taxed (C, S, or P)');
+      if (form.taxClass === 'other' && !form.otherText) out.push('Line 3a — describe the “Other” classification');
+    } else if (n === 2) {
+      if (!form.address) out.push('Line 5 — address');
+      if (!form.city || !form.state || !form.zip) out.push('Line 6 — city, state, and ZIP code');
+      else if (!/^\d{5}(-?\d{4})?$/.test(form.zip)) out.push('Line 6 — ZIP code should be 5 digits, or ZIP+4');
+      if (!form.appliedFor) {
+        var p = tinProblem(form.tin, form.tinType);
+        if (p) out.push('Part I — ' + (form.tinType === 'ein' ? 'employer identification number ' : 'social security number ') + p);
+      }
+    } else {
+      if (!form.identity) out.push('Who is signing');
+      else if (!isIndividual() && form.taxClass) {
+        if (!form.signerName) out.push('Name of the person signing');
+        if (!form.signerTitle) out.push('Title of the person signing');
+      } else if (form.identity === 'self') {
+        var last = norm(user.name).split(' ').pop();
+        if (form.name && norm(form.name).split(' ').indexOf(last) < 0) {
+          out.push('Line 1 says “' + form.name + '”, but you are signed in as ' + user.name + '. If the payee ' +
+            'is someone else, choose “Someone else, here in person”.');
+        }
+      }
+      if (sv !== undefined) {
+        if (!sv) out.push('Signature');
+        else if (sv.indexOf('typed:') === 0 && form.signerName && norm(sv.slice(6)) !== norm(form.signerName)) {
+          out.push('A typed signature has to be the signer’s full name: ' + form.signerName);
+        }
+      }
+    }
+    return out;
+  }
+
+  function notReady(miss, signing) {
+    GRYC.modal({
+      title: signing ? 'Not ready to sign' : 'A few answers are missing', okText: null,
+      body: '<p>' + (signing ? 'Before this W-9 can be signed:' : 'Still needed on this step:') + '</p>' +
+        '<ul style="margin:0;padding-left:18px">' +
+        miss.map(function (m) { return '<li>' + esc(m) + '</li>'; }).join('') + '</ul>' +
+        (saved ? '<p class="hint mt-2 mb-0">Your answers are saved as a draft — nothing is lost.</p>' : '')
+    });
+  }
+
+  /* ---- signing --------------------------------------------------------- */
+
+  function submit() {
+    collect();
+    var sv = sig ? sig.value() : '';
+    var miss = [];
+    [1, 2, 3].forEach(function (n) {
+      problems(n, n === 3 ? sv : undefined).forEach(function (m) { miss.push(STEPS[n - 1].label + ': ' + m); });
+    });
+    if (miss.length) {
+      if (saved || touched()) persist();
+      notReady(miss, true);
+      return;
+    }
+
+    form.signature = sv;
+    form.signedAt = new Date().toISOString();
+    form.signedDate = GRYC.todayISO();
+    form.status = 'signed';
+    form.collectedBy = { id: user.id, name: user.name, email: user.email };
+    form.device = GRYC.deviceLabel();
+    form.hash = GRYC.w9Fingerprint(form);
+    persist('Signed and submitted', 'Signed by ' + signerLine(form) + ' — ' + identityText(form));
+
+    GRYC.toast('W-9 signed and on file.', 'ok');
+    render();
+    window.scrollTo(0, 0);
+  }
+
+  /* ======================================================================
+     SIGNED — the form as submitted, and the record behind it
+     ====================================================================== */
+
+  var printHooked = false;
+
+  function renderView() {
+    var intact = GRYC.w9Fingerprint(form) === form.hash;
+    var req = form.requester || GRYC.W9_REQUESTER;
+    var by = form.collectedBy || {};
+
+    $('#root').innerHTML =
+      '<div class="row between wrap-row mb-3 no-print">' +
+        '<div><h1><span class="nowrap">Form W-9</span> — ' + esc(form.name) + '</h1>' +
+        '<p class="muted mb-0">' + esc([form.business, GRYC.w9ClassLabel(form)].filter(Boolean).join(' · ')) + '</p></div>' +
+        '<div class="row wrap-row">' +
+          '<span class="badge ok"><span class="dot"></span>Signed ' + esc(GRYC.fmtDate(form.signedDate)) + '</span>' +
+          '<button class="btn" id="tintoggle">Show full TIN</button>' +
+          '<button class="btn" id="print" title="Prints with the full TIN, as the IRS copy must">Print / Save PDF</button>' +
+        '</div>' +
+      '</div>' +
+
+      (form.backupWithholding
+        ? '<div class="callout mb-2 no-print" style="border-left-color:var(--bad);background:var(--bad-bg)">' +
+          '<strong>Item 2 is crossed out.</strong> The payee says the IRS has notified them that they are subject to ' +
+          'backup withholding. Check with the office before paying them — backup withholding is 24% of reportable ' +
+          'payments.</div>'
+        : '') +
+      (form.appliedFor
+        ? '<div class="callout mb-2 no-print"><strong>No TIN yet — the payee has applied for one.</strong> Payments ' +
+          'other than interest and dividends are subject to backup withholding until they provide it. Collect a new ' +
+          'W-9 once they have the number.</div>'
+        : '') +
+
+      '<div class="paper w9doc" id="doc">' + w9Doc(form) + '</div>' +
+
+      '<div class="card mt-3 print-break">' +
+        '<div class="card-h"><h2>Electronic submission record — Form W-9</h2><div class="spacer"></div>' +
+          (intact ? '<span class="badge ok">✓ Unchanged since it was signed</span>'
+                  : '<span class="badge bad">✕ Changed after it was signed</span>') + '</div>' +
+        '<div class="card-b">' +
+          (intact ? '' :
+            '<div class="callout mb-2" style="border-left-color:var(--bad);background:var(--bad-bg)">This record no ' +
+            'longer matches the fingerprint taken when it was signed. Don’t rely on it — collect a new W-9.</div>') +
+          '<div class="grid c2">' +
+            kv('Payee (line 1)', form.name) +
+            kv('Signed by', signerLine(form)) +
+            kv('Signed', stamp(form.signedAt)) +
+            kv('Identity', identityText(form)) +
+            kv('Collected by', (by.name || '—') + (by.email ? ' (' + by.email + ')' : '')) +
+            kv('Device', form.device || '—') +
+          '</div>' +
+          '<div class="lbl mt-2">Fingerprint — SHA-256 of every answer and the signature, taken at signing</div>' +
+          '<div class="mono small hashbox">' + esc(form.hash) + '</div>' +
+          '<p class="small mt-2 mb-0">To the best of ' + esc(req.name) + '’s knowledge, this electronic Form W-9 was ' +
+            'submitted by the named payee, ' + esc(form.name) + '.</p>' +
+        '</div>' +
+        '<div class="card-h loghead"><h3>Access log</h3><span class="badge" id="logcount"></span></div>' +
+        '<div class="tbl-wrap" id="w9log"></div>' +
+      '</div>';
+
+    paintLog();
+
+    $('#tintoggle').addEventListener('click', function () {
+      var doc = $('#doc'), on = !doc.classList.contains('reveal');
+      doc.classList.toggle('reveal', on);
+      $('#tintoggle').textContent = on ? 'Hide TIN' : 'Show full TIN';
+      if (on) { GRYC.logAccess(form, 'Showed the full TIN'); GRYC.putW9(form); paintLog(); }
+    });
+    $('#print').addEventListener('click', function () { window.print(); });
+
+    /* Ctrl+P counts too — a printed copy carries the full TIN. */
+    if (!printHooked) {
+      printHooked = true;
+      window.addEventListener('beforeprint', function () {
+        GRYC.logAccess(form, 'Printed', 'Hard copy, with the full TIN');
+        GRYC.putW9(form);
+        paintLog();
+      });
+    }
+  }
+
+  function kv(k, v) {
+    return '<div><div class="lbl">' + esc(k) + '</div><div class="small strong">' + esc(v || '—') + '</div></div>';
+  }
+
+  function paintLog() {
+    var log = form.audit || [];
+    $('#logcount').textContent = log.length;
+    $('#w9log').innerHTML = '<table class="tbl"><thead><tr><th>When</th><th>Who</th><th>What</th><th>Device</th>' +
+      '</tr></thead><tbody>' + log.map(function (e) {
+        return '<tr><td class="nowrap">' + esc(stamp(e.at)) + '</td>' +
+          '<td>' + esc(e.who) + (e.email ? '<div class="tiny muted">' + esc(e.email) + '</div>' : '') + '</td>' +
+          '<td><span class="strong">' + esc(e.what) + '</span>' +
+            (e.detail ? '<div class="tiny muted">' + esc(e.detail) + '</div>' : '') + '</td>' +
+          '<td class="small muted">' + esc(e.device || '—') + '</td></tr>';
+      }).join('') + '</tbody></table>';
+  }
+
+  function render() {
+    if (form.status === 'signed') renderView();
+    else renderWizard();
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>

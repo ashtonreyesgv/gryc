@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Childcare Questionnaire · GRYC SYEP Site Monitor Portal</title>
+<link rel="icon" href="assets/images/gryc_logo.png">
+<link rel="stylesheet" href="assets/styles.css?v=15">
+</head>
+<body>
+
+<main class="page"><div class="wrap">
+  <div class="crumb no-print" id="crumb"></div>
+  <div id="root"></div>
+</div></main>
+
+<script src="assets/data.js?v=15"></script>
+<script src="assets/app.js?v=15"></script>
+<script>
+/* ==========================================================================
+   Childcare Questionnaire — one participant, one form
+
+   The questions are the Childcare Site Questions off page 4 of the Worksite
+   Assessment Report, asked about a single youth instead of about the site:
+   the licence or permit on file, the supervisor ratios, whether this youth's
+   duties were outlined to them, which age band they fall in, and what they
+   actually do all day. Submitting it ticks the roster box.
+   ========================================================================== */
+(function () {
+  var $ = GRYC.$, $$ = GRYC.$$, esc = GRYC.esc;
+  var user = GRYC.requireAuth();
+  if (!user) return;
+  GRYC.renderHeader('sites');
+
+  var site = GRYC.site(GRYC.param('site'));
+  if (!site) {
+    $('#root').innerHTML = '<div class="card"><div class="empty"><p>Worksite not found.</p>' +
+      '<a class="btn" href="dashboard.html">Back</a></div></div>';
+    return;
+  }
+
+  var p = GRYC.participant(site, GRYC.param('p'));
+  if (!p) {
+    $('#root').innerHTML = '<div class="card"><div class="empty"><p>Participant not found.</p>' +
+      '<a class="btn" href="site.html?id=' + esc(site.id) + '&tab=participants">Back to site</a></div></div>';
+    return;
+  }
+
+  var forms = GRYC.participantForms(p);
+  var saved = forms.childcare || null;
+  var sigSup = null, sigYouth = null;
+
+  $('#crumb').innerHTML =
+    '<a href="dashboard.html">My Sites</a> <span class="muted">/</span> ' +
+    '<a href="site.html?id=' + esc(site.id) + '&tab=participants">' + esc(site.name) + '</a> ' +
+    '<span class="muted">/</span> Childcare questionnaire';
+
+  /* Next participant still owing one, so a roster can be worked straight down. */
+  var roster = GRYC.activeParticipants(site);
+  var nextP = roster.filter(function (x) {
+    return x.id !== p.id && !x.docs.childcare;
+  })[0] || null;
+
+  /* ======================================================================
+     working copy
+
+     Q1, Q2 and Q5 are answered the same way for every youth at a site, so a
+     blank form starts from the last completed one rather than from nothing —
+     the Worksite Application fills the gaps on the very first one.
+     ====================================================================== */
+
+  function blank() {
+    var prev = GRYC.lastChildcareForm(site, p.id);
+    var cc = site.cc || {};
+    var band = GRYC.CHILDCARE_AGE_RANGES.filter(function (r) {
+      var a = p.age || 0;
+      return (r.min == null || a >= r.min) && (r.max == null || a <= r.max);
+    })[0];
+
+    return {
+      date: GRYC.todayISO(),
+      ccDoc: prev ? prev.ccDoc : (cc.licenseType === 'Camp Permit' ? 'camp' : (cc.licenseNumber ? 'license' : '')),
+      ccDocExp: prev ? prev.ccDocExp : (cc.licenseExp || ''),
+      ratioConfirmed: false,
+      dutiesOutlined: prev ? prev.dutiesOutlined : '',
+      ageRange: p.age ? (band ? band.id : '') : '',
+      responsibilities: prev ? prev.responsibilities : ((site.jobs[0] && site.jobs[0].duties) || ''),
+      neverAlone: false,
+      supervisorName: prev ? prev.supervisorName : ((GRYC.primarySupervisor(site) || {}).name || ''),
+      supervisorSig: '', youthSig: '',
+      monitorName: user.name, completedAt: '',
+      /* set once, so a form that started from someone else's answers says so */
+      prefilledFrom: prev ? 'roster'
+        : ((cc.licenseNumber || (site.jobs[0] && site.jobs[0].duties)) ? 'application' : '')
+    };
+  }
+
+  var form = saved ? JSON.parse(JSON.stringify(saved)) : blank();
+  (function backfillForm() {
+    var b = blank();
+    Object.keys(b).forEach(function (k) { if (form[k] === undefined) form[k] = b[k]; });
+  })();
+
+  /* ======================================================================
+     render
+     ====================================================================== */
+
+  function render() {
+    var done = !!(saved && saved.completedAt);
+    var cc = site.cc || {};
+
+    $('#root').innerHTML =
+      '<div class="row between wrap-row mb-3">' +
+        '<div>' +
+          '<h1>Childcare Questionnaire</h1>' +
+          '<p class="muted mb-0">' + esc(GRYC.proster(p)) + ' · <span class="mono">' +
+            esc(p.appId || '—') + '</span> · ' + esc(site.name) + '</p>' +
+        '</div>' +
+        '<div class="row no-print">' +
+          (done ? '<span class="badge ok"><span class="dot"></span>Completed ' +
+            esc(GRYC.fmtDate(saved.date)) + '</span>' : '') +
+          '<button class="btn" onclick="window.print()">Print</button>' +
+        '</div>' +
+      '</div>' +
+
+      (p.docs.childcare && !saved
+        ? '<div class="card mb-2"><div class="card-b tight" style="background:var(--info-bg);border-radius:10px">' +
+          '<span class="strong" style="color:var(--brand)">Already ticked on the roster.</span> ' +
+          '<span class="small">No digital form on file — this one was recorded on paper. ' +
+          'Completing it here replaces the paper copy.</span></div></div>'
+        : '') +
+
+      (!done && form.prefilledFrom
+        ? '<div class="card mb-2"><div class="card-b tight" style="background:var(--info-bg);border-radius:10px">' +
+          '<span class="small">Started from ' +
+          (form.prefilledFrom === 'roster'
+            ? 'the last questionnaire completed at this site'
+            : 'the Worksite Application') +
+          ' — check every answer against what the supervisor tells you about ' +
+          esc(GRYC.pname(p)) + '.</span></div></div>'
+        : '') +
+
+      '<div class="grid side">' +
+        '<div>' +
+
+          /* ---- Q1 licence / permit ---- */
+          '<div class="card mb-2"><div class="card-h"><h2>Licence or permit on file</h2>' +
+            '<div class="spacer"></div><span class="badge">Packet p.4 · Q1</span></div>' +
+          '<div class="card-b">' +
+            '<p class="small mb-2">Please confirm the most current License or Permit is on file and ' +
+              'available for review as required.</p>' +
+            '<div class="grid c2">' +
+              '<div class="field mb-0"><label class="req">Available document</label>' +
+                '<div class="rate">' + GRYC.CHILDCARE_DOCS.map(function (d) {
+                  return '<label><input type="radio" name="ccdoc" data-doc value="' + esc(d.id) + '"' +
+                    (form.ccDoc === d.id ? ' checked' : '') + '><span>' + esc(d.text) +
+                    (d.em ? ' <em class="tiny">' + esc(d.em) + '</em>' : '') + '</span></label>';
+                }).join('') + '</div>' +
+                (cc.licenseType
+                  ? '<div class="hint">Application says: ' + esc(cc.licenseType) +
+                    (cc.licenseNumber ? ' ' + esc(cc.licenseNumber) : '') + '</div>'
+                  : '<div class="hint">No Attachment 1 on file for this site — ask the supervisor ' +
+                    'which one they hold.</div>') +
+              '</div>' +
+              '<div class="field mb-0"><label>Date of expiration</label>' +
+                '<input type="date" id="c_exp" value="' + esc(form.ccDocExp || '') + '"></div>' +
+            '</div>' +
+          '</div></div>' +
+
+          /* ---- ratios ---- */
+          '<div class="card mb-2"><div class="card-h"><h2>Supervisor ratios</h2></div>' +
+          '<div class="card-b">' +
+            '<p class="small mb-2">Please review and confirm the site supervisor is aware of the ' +
+              'childcare related ratio of supervisors to participants. <em>Sites should follow all ' +
+              'DOH regulations for child supervision.</em></p>' +
+            '<div class="tbl-wrap mb-2"><table class="tbl"><thead><tr><th>Age Group</th>' +
+              '<th class="center">Normal Activities</th><th class="center">Off-site Trips</th></tr></thead><tbody>' +
+              GRYC.CHILDCARE_RATIOS.map(function (r, i) {
+                return '<tr><td>' + esc(r.age) + '</td><td class="center strong">' + esc(r.normal) + '</td>' +
+                  (i === 0 ? '<td class="center strong" rowspan="' + GRYC.CHILDCARE_RATIOS.length + '">' +
+                    esc(GRYC.CHILDCARE_TRIP_RATIO) + '</td>' : '') + '</tr>';
+              }).join('') + '</tbody></table></div>' +
+            '<label class="check' + (form.ratioConfirmed ? ' on' : '') + '">' +
+              '<input type="checkbox" id="c_ratio" data-chk' + (form.ratioConfirmed ? ' checked' : '') + '>' +
+              '<span class="ct">Reviewed with the supervisor, who is aware of these ratios</span></label>' +
+            '<label class="check' + (form.neverAlone ? ' on' : '') + '">' +
+              '<input type="checkbox" id="c_alone" data-chk' + (form.neverAlone ? ' checked' : '') + '>' +
+              '<span class="ct">' + esc(GRYC.CHILDCARE_NOTE) + '</span></label>' +
+          '</div></div>' +
+
+          /* ---- Q2 / Q3 / Q4 ---- */
+          '<div class="card mb-2"><div class="card-h"><h2>This participant</h2>' +
+            '<div class="spacer"></div><span class="badge">Packet p.4 · Q2–Q4</span></div>' +
+          '<div class="card-b">' +
+            '<div class="row between wrap-row mb-3">' +
+              '<div style="flex:1;min-width:240px">Have this participant’s job duties been clearly ' +
+                'outlined to them and do they meet the requirements as described in the Worksite ' +
+                'Application?</div>' +
+              GRYC.triState('ccduties', 'dutiesOutlined', form.dutiesOutlined, false) +
+            '</div>' +
+
+            '<div class="lbl req">Age range of this participant</div>' +
+            GRYC.CHILDCARE_AGE_RANGES.map(function (r) {
+              return '<label class="check' + (form.ageRange === r.id ? ' on' : '') + '">' +
+                '<input type="radio" name="ccage" data-age value="' + esc(r.id) + '"' +
+                (form.ageRange === r.id ? ' checked' : '') + '>' +
+                '<span class="ct">' + esc(r.text) + ' — ' + esc(r.em) + '</span></label>';
+            }).join('') +
+            '<div class="hint">Roster age: ' + esc(p.age || '—') + '.</div>' +
+
+            '<div class="field mt-3 mb-0"><label class="req">What are the daily responsibilities of ' +
+              'the participant? <em>(as described by the supervisor)</em></label>' +
+              '<textarea id="c_resp" rows="4">' + esc(form.responsibilities) + '</textarea>' +
+              '<div class="hint">Describe what this youth does, not the job title on the application.</div></div>' +
+          '</div></div>' +
+
+          /* ---- signatures ---- */
+          '<div class="card"><div class="card-h"><h2>Signatures</h2></div><div class="card-b">' +
+            '<div class="field"><label>Worksite supervisor answering these questions</label>' +
+              '<input type="text" id="c_supname" value="' + esc(form.supervisorName) + '" list="sl">' +
+              '<datalist id="sl">' + site.supervisors.map(function (s) {
+                return '<option value="' + esc(s.name) + '">';
+              }).join('') + '</datalist></div>' +
+            '<div class="grid c2">' +
+              '<div><div class="lbl req">Supervisor signature</div><div id="sigA"></div></div>' +
+              '<div><div class="lbl req">Participant signature</div><div id="sigB"></div></div>' +
+            '</div>' +
+            '<p class="hint mt-2 mb-0">The participant signs to confirm the duties above were actually ' +
+              'explained to them.</p>' +
+          '</div></div>' +
+        '</div>' +
+
+        /* ---- side rail ---- */
+        '<div>' +
+          '<div class="card mb-2"><div class="card-b">' +
+            '<h3 class="mb-2">Participant</h3>' +
+            '<div class="row mb-2"><div class="avatar" style="background:var(--pink)">' +
+              esc(GRYC.initials(GRYC.pname(p))) + '</div>' +
+              '<div><div class="strong">' + esc(GRYC.proster(p)) + '</div>' +
+              '<div class="tiny muted">Age ' + esc(p.age || '—') + ' · ' + esc(p.borough || '') +
+              '</div></div></div>' +
+            row('Application ID', p.appId || '—') +
+            row('Cohort', p.cohort || '—') +
+            row('Worksite', site.name) +
+            row('Referral sheet', p.docs.referral ? '✓ On file' : '✗ Missing') +
+            row('Childcare questionnaire', p.docs.childcare ? '✓ On file' : 'Outstanding') +
+          '</div></div>' +
+
+          '<div class="card mb-2"><div class="card-b">' +
+            '<h3 class="mb-1">Save</h3>' +
+            '<p class="tiny muted">Submitting ticks the Childcare Questionnaire box on the roster.</p>' +
+            '<button class="btn primary block mb-1" id="save">Submit questionnaire</button>' +
+            '<button class="btn block' + (done ? ' mb-1' : '') + '" id="draft">Save draft</button>' +
+            (done
+              ? '<button class="btn ghost block" id="unmark">Mark as not received</button>'
+              : '') +
+          '</div></div>' +
+
+          (nextP
+            ? '<a class="card sitecard" href="childcare.html?site=' + esc(site.id) + '&p=' + esc(nextP.id) + '">' +
+              '<div class="card-b"><div class="tiny muted">Next one outstanding</div>' +
+              '<div class="strong">' + esc(GRYC.proster(nextP)) + ' →</div></div></a>'
+            : '<div class="card"><div class="card-b tight"><p class="tiny muted mb-0">' +
+              'Nobody else on this roster is owing a questionnaire.</p></div></div>') +
+        '</div>' +
+      '</div>';
+
+    /* keep the tick-box and radio styling in step with what is checked */
+    $$('[data-chk]').forEach(function (c) {
+      c.addEventListener('change', function () { c.closest('.check').classList.toggle('on', c.checked); });
+    });
+    $$('[data-age]').forEach(function (r) {
+      r.addEventListener('change', function () {
+        $$('[data-age]').forEach(function (x) { x.closest('.check').classList.toggle('on', x.checked); });
+      });
+    });
+
+    sigSup = GRYC.signaturePad($('#sigA'), { label: 'Worksite supervisor', defaultName: form.supervisorName });
+    sigYouth = GRYC.signaturePad($('#sigB'), { label: GRYC.pname(p), defaultName: GRYC.pname(p) });
+    if (form.supervisorSig) sigSup.set(form.supervisorSig);
+    if (form.youthSig) sigYouth.set(form.youthSig);
+
+    $('#save').addEventListener('click', function () { collect(); complete(); });
+    $('#draft').addEventListener('click', function () {
+      collect();
+      form.completedAt = '';
+      forms.childcare = JSON.parse(JSON.stringify(form));
+      GRYC.save();
+      GRYC.toast('Draft saved.', 'ok');
+    });
+
+    var un = $('#unmark');
+    if (un) {
+      un.addEventListener('click', function () {
+        GRYC.confirmBox('Mark as not received',
+          'This unticks the Childcare Questionnaire box for ' + GRYC.proster(p) +
+          '. The answers stay on file.', 'Untick it', function () {
+            p.docs.childcare = false;
+            GRYC.save();
+            location.href = 'site.html?id=' + site.id + '&tab=participants';
+          });
+      });
+    }
+  }
+
+  function row(k, v) {
+    return '<div class="row between" style="padding:6px 0;border-bottom:1px solid var(--line-2)">' +
+      '<span class="muted small">' + esc(k) + '</span><span class="small strong">' + esc(v) + '</span></div>';
+  }
+
+  function collect() {
+    var doc = $$('[data-doc]').filter(function (r) { return r.checked; })[0];
+    form.ccDoc = doc ? doc.value : '';
+    form.ccDocExp = $('#c_exp').value;
+    form.ratioConfirmed = $('#c_ratio').checked;
+    form.neverAlone = $('#c_alone').checked;
+    var duties = $$('[data-tri="dutiesOutlined"]').filter(function (r) { return r.checked; })[0];
+    form.dutiesOutlined = duties ? duties.value : '';
+    var band = $$('[data-age]').filter(function (r) { return r.checked; })[0];
+    form.ageRange = band ? band.value : '';
+    form.responsibilities = $('#c_resp').value.trim();
+    form.supervisorName = $('#c_supname').value.trim();
+    form.supervisorSig = sigSup.value() || form.supervisorSig;
+    form.youthSig = sigYouth.value() || form.youthSig;
+  }
+
+  function complete() {
+    var missing = [];
+    if (!form.ccDoc) missing.push('Which licence or permit is on file');
+    if (!form.ratioConfirmed) missing.push('Confirmation that the supervisor is aware of the ratios');
+    if (!form.neverAlone) missing.push('Confirmation that participants are never left alone with children');
+    if (!form.dutiesOutlined) missing.push('Whether job duties were outlined to the youth — Yes/No');
+    if (!form.ageRange) missing.push('Age range of this participant');
+    if (!form.responsibilities) missing.push('Daily responsibilities of the participant');
+    if (!form.supervisorSig) missing.push('Supervisor signature');
+    if (!form.youthSig) missing.push('Participant signature');
+
+    if (missing.length) {
+      forms.childcare = JSON.parse(JSON.stringify(form));
+      GRYC.save();
+      GRYC.modal({
+        title: 'Not ready to submit', okText: null,
+        body: '<p>This questionnaire is missing:</p><ul style="margin:0;padding-left:18px">' +
+          missing.map(function (m) { return '<li>' + esc(m) + '</li>'; }).join('') + '</ul>' +
+          '<p class="hint mt-2 mb-0">Your work is saved as a draft — nothing is lost.</p>'
+      });
+      return;
+    }
+
+    var now = new Date();
+    form.date = GRYC.todayISO();
+    form.completedAt = GRYC.fmtDate(form.date) + ' at ' +
+      GRYC.fmtTime(GRYC.pad(now.getHours()) + ':' + GRYC.pad(now.getMinutes()));
+    forms.childcare = JSON.parse(JSON.stringify(form));
+    p.docs.childcare = true;
+    GRYC.save();
+    GRYC.toast(GRYC.proster(p) + ' — childcare questionnaire on file.', 'ok');
+
+    setTimeout(function () {
+      location.href = nextP
+        ? 'childcare.html?site=' + site.id + '&p=' + nextP.id
+        : 'site.html?id=' + site.id + '&tab=participants';
+    }, 700);
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>

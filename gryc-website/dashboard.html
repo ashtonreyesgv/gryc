@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>My Sites · GRYC SYEP Site Monitor Portal</title>
+<link rel="icon" href="assets/images/gryc_logo.png">
+<link rel="stylesheet" href="assets/styles.css?v=15">
+</head>
+<body>
+
+<main class="page"><div class="wrap">
+
+  <div class="row between wrap-row mb-3">
+    <div>
+      <h1 id="hello">My Sites</h1>
+      <p class="muted mb-0" id="subtitle"></p>
+    </div>
+    <div class="row">
+      <span class="tiny muted nowrap" id="build" title="Which build of the demo this browser actually loaded"></span>
+      <button class="btn" id="resetdemo">Reset demo data</button>
+      <button class="btn primary" id="addsite">+ Register a worksite</button>
+    </div>
+  </div>
+
+  <div class="grid c4 mb-3" id="stats"></div>
+
+  <h2 class="sec-title">Assigned worksites</h2>
+  <div class="grid c3 mb-3" id="sites"></div>
+
+  <h2 class="sec-title">Notes &amp; reminders</h2>
+  <div class="card mb-3" id="notes"></div>
+
+  <h2 class="sec-title">Form W-9</h2>
+  <div class="card mb-3" id="w9s"></div>
+
+  <h2 class="sec-title">Form I-9</h2>
+  <div class="card" id="i9s"></div>
+
+</div></main>
+
+<script src="assets/data.js?v=15"></script>
+<script src="assets/app.js?v=15"></script>
+<script>
+(function () {
+  var $ = GRYC.$, esc = GRYC.esc;
+  var user = GRYC.requireAuth();
+  if (!user) return;
+  GRYC.renderHeader('sites');
+
+  var cw = GRYC.currentWeek();
+  var wk = GRYC.week(cw);
+
+  $('#build').textContent = 'build ' + GRYC.BUILD;
+  $('#hello').textContent = 'Welcome back, ' + user.name.split(' ')[0];
+  $('#subtitle').textContent =
+    GRYC.PROGRAM.cycle + ' · Week ' + cw + ' of 6 · ' +
+    GRYC.fmtShort(wk.start) + ' – ' + GRYC.fmtDate(wk.end);
+
+  function render() {
+    var sites = GRYC.mySites();
+
+    /* ---- top stats ---- */
+    var youth = 0, assessDone = 0, docsOut = 0, interviewsOut = 0;
+    sites.forEach(function (s) {
+      youth += GRYC.activeParticipants(s).length;
+      var w = GRYC.weekData(s, cw);
+      if (w.assessment && w.assessment.status === 'submitted') assessDone++;
+      else interviewsOut += GRYC.INTERVIEWS_REQUIRED;
+      docsOut += GRYC.outstandingDocs(s);
+    });
+
+    $('#stats').innerHTML = [
+      ['', sites.length, 'Worksites assigned'],
+      ['pink', youth, 'Active participants'],
+      ['green', assessDone + ' / ' + sites.length, 'Week ' + cw + ' assessments filed'],
+      ['yellow', docsOut, 'Participant docs outstanding']
+    ].map(function (s) {
+      return '<div class="card stat ' + s[0] + '"><div class="bar"></div>' +
+             '<div class="n">' + esc(s[1]) + '</div><div class="l">' + esc(s[2]) + '</div></div>';
+    }).join('');
+
+    /* ---- site cards ---- */
+    if (!sites.length) {
+      $('#sites').innerHTML =
+        '<div class="card" style="grid-column:1/-1"><div class="empty">' +
+        '<div class="big">📋</div><p class="strong">No sites yet</p>' +
+        '<p class="muted">Register your first worksite to start monitoring.</p></div></div>';
+      return;
+    }
+
+    $('#sites').innerHTML = sites.map(function (s) {
+      var w = GRYC.weekData(s, cw);
+      var prog = GRYC.docProgress(s);
+      var visited = (s.log || []).some(function (l) { return l.date >= wk.start && l.date <= wk.ending; });
+      var a = w.assessment;
+      var flags = a && a.status === 'submitted' ? GRYC.findings(a, s).length : 0;
+
+      var chips = [];
+      chips.push(visited
+        ? '<span class="badge ok"><span class="dot"></span>Visited</span>'
+        : '<span class="badge warn"><span class="dot"></span>Not visited</span>');
+      chips.push(w.timesheets.status === 'collected'
+        ? '<span class="badge ok">Timesheets in</span>'
+        : '<span class="badge">Timesheets due</span>');
+      chips.push(a && a.status === 'submitted'
+        ? (flags ? '<span class="badge warn">' + flags + ' flagged</span>'
+                 : '<span class="badge ok">Assessment done</span>')
+        : a ? '<span class="badge warn">Assessment draft</span>'
+            : '<span class="badge bad">Assessment due</span>');
+      if (s.childcare) chips.push('<span class="badge info">Childcare</span>');
+
+      return '' +
+      '<a class="card sitecard" href="site.html?id=' + esc(s.id) + '">' +
+        '<div class="card-b">' +
+          '<div class="top">' +
+            '<div class="icon">' + esc(s.emoji || '🏢') + '</div>' +
+            '<div style="min-width:0">' +
+              '<h3 style="margin-bottom:2px">' + esc(s.name) + '</h3>' +
+              '<div class="small muted">' + esc(GRYC.fullAddress(s)) + '</div>' +
+              '<div class="tiny muted">' + esc(s.worksiteType) +
+                (s.dycdId ? ' · <span class="mono">' + esc(s.dycdId) + '</span>' : '') + '</div>' +
+            '</div>' +
+          '</div>' +
+          '<div class="row wrap-row" style="gap:6px;margin-top:14px">' + chips.join('') + '</div>' +
+          '<div class="mt-2">' +
+            '<div class="row between tiny muted" style="margin-bottom:5px">' +
+              '<span>' + GRYC.activeParticipants(s).length + ' participants · paperwork</span>' +
+              '<span>' + prog.done + '/' + prog.total + '</span>' +
+            '</div>' +
+            '<div class="meter"><i style="width:' + prog.pct + '%;background:' +
+              (prog.pct === 100 ? 'var(--green)' : prog.pct >= 60 ? 'var(--yellow)' : 'var(--pink)') +
+            '"></i></div>' +
+          '</div>' +
+        '</div>' +
+      '</a>';
+    }).join('');
+  }
+
+  /* ---- notes & reminders ----------------------------------------------
+     A scratchpad for the monitor: things to raise with the office, things to
+     verify at the next visit, anything that has no box on a DYCD form.     */
+
+  function renderNotes() {
+    var notes = GRYC.myNotes().slice().sort(function (a, b) {
+      if (a.done !== b.done) return a.done ? 1 : -1;
+      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+      return (b.createdAt || '').localeCompare(a.createdAt || '');
+    });
+    var open = notes.filter(function (n) { return !n.done; }).length;
+
+    $('#notes').innerHTML =
+      '<div class="card-h"><h2>Notes &amp; reminders</h2>' +
+        '<span class="badge' + (open ? ' warn' : ' ok') + '">' + open + ' open</span>' +
+        '<div class="spacer"></div>' +
+        (notes.some(function (n) { return n.done; })
+          ? '<button class="btn sm ghost" id="clearnotes">Clear done</button>' : '') +
+      '</div>' +
+      '<div class="card-b">' +
+        '<form id="noteform" class="noteadd">' +
+          '<input type="text" id="notetext" placeholder="Something to remember, or to tell the boss later…" ' +
+            'autocomplete="off">' +
+          '<button class="btn primary" type="submit">Add</button>' +
+        '</form>' +
+      '</div>' +
+      (notes.length
+        ? '<ul class="notelist">' + notes.map(function (n) {
+            return '<li class="' + (n.done ? 'done' : '') + (n.pinned ? ' pinned' : '') + '">' +
+              '<input type="checkbox" data-notedone="' + esc(n.id) + '"' + (n.done ? ' checked' : '') + '>' +
+              '<span class="nt">' + esc(n.text) + '</span>' +
+              '<span class="when tiny muted">' + esc(GRYC.fmtShort((n.createdAt || '').slice(0, 10))) + '</span>' +
+              '<button class="btn sm ghost" data-notepin="' + esc(n.id) + '" title="Pin to the top">' +
+                (n.pinned ? '★' : '☆') + '</button>' +
+              '<button class="btn sm ghost danger" data-notedel="' + esc(n.id) + '">×</button>' +
+            '</li>';
+          }).join('') + '</ul>'
+        : '<div class="empty"><div class="big">📝</div><p class="strong">Nothing noted yet</p>' +
+          '<p class="muted mb-0">Jot down anything that does not have a box on a DYCD form — ' +
+          'a supervisor question, a roster discrepancy, something to raise at the office.</p></div>');
+
+    $('#noteform').addEventListener('submit', function (e) {
+      e.preventDefault();
+      var t = $('#notetext').value.trim();
+      if (!t) return;
+      GRYC.addNote(t);
+      renderNotes();
+      $('#notetext').focus();
+    });
+
+    GRYC.$$('[data-notedone]').forEach(function (cb) {
+      cb.addEventListener('change', function () {
+        GRYC.updateNote(cb.dataset.notedone, { done: cb.checked });
+        renderNotes();
+      });
+    });
+    GRYC.$$('[data-notepin]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        var n = GRYC.myNotes().filter(function (x) { return x.id === b.dataset.notepin; })[0];
+        GRYC.updateNote(b.dataset.notepin, { pinned: !n.pinned });
+        renderNotes();
+      });
+    });
+    GRYC.$$('[data-notedel]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        GRYC.removeNote(b.dataset.notedel);
+        renderNotes();
+      });
+    });
+    if ($('#clearnotes')) {
+      $('#clearnotes').addEventListener('click', function () {
+        GRYC.myNotes().filter(function (n) { return n.done; })
+          .forEach(function (n) { GRYC.removeNote(n.id); });
+        renderNotes();
+      });
+    }
+  }
+
+  /* ---- Form W-9 --------------------------------------------------------
+     Taxpayer ID forms collected for GRYC. The payee answers plain questions
+     on w9.html, the answers are laid out on the IRS form, and the signature
+     goes on last. Only the last four digits of a TIN are ever shown here. */
+
+  function renderW9s() {
+    var list = GRYC.myW9s().slice().sort(function (a, b) {
+      if ((a.status === 'signed') !== (b.status === 'signed')) return a.status === 'signed' ? 1 : -1;
+      return (b.signedAt || b.updatedAt || '').localeCompare(a.signedAt || a.updatedAt || '');
+    });
+    var signed = list.filter(function (f) { return f.status === 'signed'; }).length;
+    var drafts = list.length - signed;
+
+    $('#w9s').innerHTML =
+      '<div class="card-h" style="flex-wrap:wrap"><h2 class="nowrap">Form W-9</h2>' +
+        '<span class="badge' + (signed ? ' ok' : '') + '">' + signed + ' signed</span>' +
+        (drafts ? '<span class="badge warn">' + drafts + (drafts === 1 ? ' draft' : ' drafts') + '</span>' : '') +
+        '<div class="spacer"></div>' +
+        '<a class="btn sm primary" href="w9.html">+ New W-9</a>' +
+      '</div>' +
+      (list.length
+        ? '<ul class="formlist">' + list.map(function (f) {
+            /* an Applied For TIN gets a badge instead */
+            var tin = f.appliedFor ? ''
+              : f.tin ? (f.tinType === 'ein' ? 'EIN ' : 'SSN ') + GRYC.fmtTin(f.tin, f.tinType, true) : 'No TIN yet';
+            var chips = [];
+            chips.push(f.status === 'signed'
+              ? '<span class="badge ok"><span class="dot"></span>Signed ' + esc(GRYC.fmtShort(f.signedDate)) + '</span>'
+              : '<span class="badge warn"><span class="dot"></span>Draft</span>');
+            if (f.status === 'signed' && f.appliedFor) chips.push('<span class="badge warn">TIN applied for</span>');
+            if (f.status === 'signed' && f.backupWithholding) chips.push('<span class="badge bad">Backup withholding</span>');
+            return '<li><a href="w9.html?id=' + esc(f.id) + '">' +
+              '<span class="fic">W-9</span>' +
+              '<span class="fwho"><b>' + esc(f.name || 'Untitled W-9') + '</b>' +
+                '<span class="tiny muted">' + esc([f.business, GRYC.w9ClassLabel(f), tin].filter(Boolean).join(' · ')) +
+              '</span></span>' +
+              '<span class="fst">' + chips.join('') + '</span>' +
+            '</a></li>';
+          }).join('') + '</ul>'
+        : '<div class="empty"><div class="big">📄</div><p class="strong">No W-9s collected yet</p>' +
+          '<p class="muted mb-0">The payee types the answers in once, the app lays them out on the IRS Form W-9, ' +
+          'and their signature goes on last — with the access log the IRS asks electronic W-9s to keep.</p></div>');
+  }
+
+  /* ---- Form I-9 --------------------------------------------------------
+     Employment eligibility, signed twice: the employee's Section 1, then
+     Section 2 once someone has examined their documents. The search box and
+     the CSV export are the searchable index and the "electronic summary
+     file" 8 CFR 274a.2(e) expects of I-9s kept electronically.            */
+
+  var i9Query = '';
+
+  function renderI9s() {
+    var all = GRYC.myI9s();
+    var done = all.filter(function (f) { return f.status === 'complete'; }).length;
+    var waiting = all.filter(function (f) { return f.status === 'section1'; }).length;
+    var drafts = all.length - done - waiting;
+
+    $('#i9s').innerHTML =
+      '<div class="card-h" style="flex-wrap:wrap"><h2 class="nowrap">Form I-9</h2>' +
+        '<span class="badge' + (done ? ' ok' : '') + '">' + done + ' complete</span>' +
+        (waiting ? '<span class="badge warn">' + waiting + ' awaiting Section 2</span>' : '') +
+        (drafts ? '<span class="badge warn">' + drafts + (drafts === 1 ? ' draft' : ' drafts') + '</span>' : '') +
+        '<div class="spacer"></div>' +
+        (all.length
+          ? '<input type="search" class="inline-search" id="i9q" placeholder="Search by name…" value="' + esc(i9Query) + '">' +
+            '<button class="btn sm" id="i9csv" title="Every field of every I-9, SSNs included">Export CSV</button>'
+          : '') +
+        '<a class="btn sm primary" href="i9.html">+ New I-9</a>' +
+      '</div>' +
+      '<div id="i9body"></div>';
+
+    if (all.length) {
+      $('#i9q').addEventListener('input', function () { i9Query = this.value; paintI9List(); });
+      $('#i9csv').addEventListener('click', exportI9s);
+    }
+    paintI9List();
+  }
+
+  function paintI9List() {
+    var today = GRYC.todayISO(), q = norm(i9Query);
+    var list = GRYC.myI9s().filter(function (f) {
+      return !q || norm([f.lastName, f.firstName, f.otherLastNames, f.email].join(' ')).indexOf(q) > -1;
+    }).sort(function (a, b) {
+      var ra = a.status === 'complete' ? 1 : 0, rb = b.status === 'complete' ? 1 : 0;
+      if (ra !== rb) return ra - rb;
+      return (b.updatedAt || '').localeCompare(a.updatedAt || '');
+    });
+
+    if (!GRYC.myI9s().length) {
+      $('#i9body').innerHTML = '<div class="empty"><div class="big">🪪</div><p class="strong">No I-9s yet</p>' +
+        '<p class="muted mb-0">The employee fills in Section 1 and signs it; once you’ve examined the documents ' +
+        'they chose, you complete Section 2. Everything is laid out on the USCIS form, with the audit trail ' +
+        'electronic I-9s have to keep.</p></div>';
+      return;
+    }
+    if (!list.length) {
+      $('#i9body').innerHTML = '<div class="empty"><p class="muted mb-0">No I-9 matches “' + esc(i9Query) + '”.</p></div>';
+      return;
+    }
+
+    $('#i9body').innerHTML = '<ul class="formlist">' + list.map(function (f) {
+      var chips = [], due = GRYC.i9Section2Due(f), rv = GRYC.i9ReverifyBy(f);
+      if (f.status === 'draft') {
+        chips.push('<span class="badge warn"><span class="dot"></span>Draft — Section 1</span>');
+      } else if (f.status === 'section1') {
+        chips.push(!due ? '<span class="badge warn"><span class="dot"></span>Awaiting Section 2</span>'
+          : today > due ? '<span class="badge bad"><span class="dot"></span>Section 2 overdue · ' + esc(GRYC.fmtShort(due)) + '</span>'
+          : '<span class="badge warn"><span class="dot"></span>Section 2 due ' + esc(GRYC.fmtShort(due)) + '</span>');
+      } else {
+        chips.push('<span class="badge ok"><span class="dot"></span>Complete ' + esc(GRYC.fmtShort(f.s2SignedDate)) + '</span>');
+        if (rv) {
+          chips.push('<span class="badge ' + (today > rv ? 'bad' : GRYC.addDays(today, 90) >= rv ? 'warn' : 'info') + '">' +
+            (today > rv ? 'Reverify overdue · ' : 'Reverify by ') + esc(GRYC.fmtShort(rv)) + '</span>');
+        }
+      }
+      var status = { citizen: 'U.S. citizen', national: 'Noncitizen national',
+                     lpr: 'Permanent resident', alien: 'Authorized to work' }[f.citizenship] || '';
+      return '<li><a href="i9.html?id=' + esc(f.id) + '">' +
+        '<span class="fic">I-9</span>' +
+        '<span class="fwho"><b>' + esc(f.lastName || f.firstName ? GRYC.i9Name(f) : 'Untitled I-9') + '</b>' +
+          '<span class="tiny muted">' + esc([status, f.firstDay ? 'first day ' + GRYC.fmtShort(f.firstDay) : '']
+            .filter(Boolean).join(' · ') || 'Section 1 not finished') + '</span></span>' +
+        '<span class="fst">' + chips.join('') + '</span>' +
+      '</a></li>';
+    }).join('') + '</ul>';
+  }
+
+  function norm(s) { return String(s || '').toLowerCase().replace(/\s+/g, ' ').trim(); }
+
+  /* Every information field on every I-9, one row each — the summary file an
+     inspecting agency may ask for. Signatures are recorded as when and by
+     whom, not as images. Each exported record logs the export. */
+  function exportI9s() {
+    var list = GRYC.myI9s();
+    var doc = function (d) { d = d || {}; return [d.title, d.issuer, d.number, d.expiry]; };
+    var docCols = function (label) {
+      return [label + ' title', label + ' issuing authority', label + ' number', label + ' expiration'];
+    };
+    var head = ['I-9 ID', 'Status', 'Edition', 'Last name', 'First name', 'Middle initial', 'Other last names',
+      'Address', 'Apt', 'City', 'State', 'ZIP', 'Date of birth', 'SSN', 'Email', 'Phone',
+      'Citizenship or immigration status', 'USCIS/A-Number (permanent resident)', 'Authorized to work until',
+      'USCIS A-Number (item 4)', 'Form I-94 admission number', 'Foreign passport number', 'Country of issuance',
+      'Preparer/translator', 'Preparer name', 'Preparer address', 'Supplement A signed',
+      'Section 1 signed', 'Section 1 signed by', 'How Section 1 was signed']
+      .concat(docCols('List A doc 1'), docCols('List A doc 2'), docCols('List A doc 3'),
+              docCols('List B'), docCols('List C'))
+      .concat(['Additional information', 'Alternative procedure', 'First day of employment', 'Section 2 due',
+        'Employer representative', 'Title', 'Section 2 signed', 'Employer', 'Employer address', 'Reverify by',
+        'Section 1 fingerprint', 'Section 2 fingerprint']);
+
+    var rows = list.map(function (f) {
+      var p = f.preparer || {}, emp = f.employer || GRYC.I9_EMPLOYER, A = f.listA || [];
+      return [f.id, f.status, f.edition, f.lastName, f.firstName, f.middleInitial, f.otherLastNames,
+        f.address, f.apt, f.city, f.state, f.zip, f.dob, f.ssn, f.email, f.phone,
+        f.citizenship, f.lprNumber, f.workUntilNA ? 'N/A' : f.workUntil, f.alienA, f.i94, f.passportNo, f.passportCountry,
+        f.helper === 'none' ? '' : f.helper === 'minor' ? 'Parent or guardian (minor)' : 'Preparer/translator',
+        [p.firstName, p.lastName].filter(Boolean).join(' '), [p.address, p.city, p.state, p.zip].filter(Boolean).join(', '),
+        p.signedAt, f.s1SignedAt, f.employeeSig === 'minor' ? GRYC.I9_MINOR : (f.s1SignedAt ? f.firstName + ' ' + f.lastName : ''),
+        f.s1Identity]
+        .concat(doc(A[0]), doc(A[1]), doc(A[2]), doc(f.listB), doc(f.listC))
+        .concat([f.additionalInfo, f.altProcedure ? 'Yes' : '', f.firstDay, GRYC.i9Section2Due(f),
+          [f.repFirst, f.repLast].filter(Boolean).join(' '), f.repTitle, f.s2SignedAt,
+          emp.name, emp.address + ', ' + emp.city, GRYC.i9ReverifyBy(f), f.s1Hash, f.s2Hash]);
+    });
+
+    /* Quote every cell, and defuse anything a spreadsheet would run as a formula. */
+    function cell(v) {
+      v = v == null ? '' : String(v);
+      if (/^[=+\-@\t\r]/.test(v)) v = "'" + v;
+      return '"' + v.replace(/"/g, '""') + '"';
+    }
+    var csv = [head].concat(rows).map(function (r) { return r.map(cell).join(','); }).join('\r\n');
+
+    list.forEach(function (f) {
+      GRYC.logAccess(f, 'Exported to CSV', 'Summary file of ' + list.length + ' I-9' + (list.length === 1 ? '' : 's'));
+      GRYC.putI9(f);
+    });
+
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' }));
+    a.download = 'gryc-form-i9-' + GRYC.todayISO() + '.csv';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    GRYC.toast('Exported ' + list.length + ' I-9' + (list.length === 1 ? '' : 's') + '.', 'ok');
+  }
+
+  /* ---- register a worksite ---- */
+  $('#addsite').addEventListener('click', function () {
+    var dlg = GRYC.modal({
+      title: 'Register a worksite',
+      wide: true,
+      okText: 'Register site',
+      body:
+        '<p class="small muted">Fields follow the DYCD <em>Worksite Application</em>. Anything you skip can be ' +
+          'filled in later on the site’s Worksite Application tab.</p>' +
+
+        '<h3 class="sec-title mt-2">General Information</h3>' +
+        '<div class="grid c2">' +
+          '<div class="field"><label class="req">Worksite Name</label>' +
+            '<input type="text" id="f_name" placeholder="Worksite name as it appears on the application"></div>' +
+          '<div class="field"><label>Site code / DYCD ID</label>' +
+            '<input type="text" id="f_dycd" placeholder="DYCD site code"></div>' +
+        '</div>' +
+        '<div class="grid c2">' +
+          '<div class="field"><label class="req">Address</label>' +
+            '<input type="text" id="f_addr" placeholder="Street address"></div>' +
+          '<div class="field"><label>Room/Floor/Suite</label><input type="text" id="f_room"></div>' +
+        '</div>' +
+        '<div class="grid c3">' +
+          '<div class="field"><label>Borough</label><select id="f_boro">' +
+            GRYC.BOROUGHS.map(function (b) { return '<option>' + esc(b) + '</option>'; }).join('') +
+          '</select></div>' +
+          '<div class="field"><label>ZIP</label><input type="text" id="f_zip" placeholder="ZIP code"></div>' +
+          '<div class="field"><label>Worksite Type</label><select id="f_wtype">' +
+            GRYC.WORKSITE_TYPES.map(function (t) { return '<option>' + esc(t) + '</option>'; }).join('') +
+          '</select></div>' +
+        '</div>' +
+        '<div class="grid c2">' +
+          '<div class="field"><label>Between/Cross Streets</label>' +
+            '<input type="text" id="f_cross" placeholder="Between which two streets"></div>' +
+          '<div class="field"><label>Industry</label>' +
+            '<input type="text" id="f_ind" placeholder="Type of business or program"></div>' +
+        '</div>' +
+        '<div class="field"><label>Travel Directions <span class="muted">(train / bus info)</span></label>' +
+          '<textarea id="f_travel" rows="2" placeholder="Bus and train directions to the site"></textarea></div>' +
+        '<div class="grid c3">' +
+          '<div class="field"><label>Sector</label><select id="f_sector">' +
+            GRYC.SECTORS.map(function (t) { return '<option>' + esc(t) + '</option>'; }).join('') +
+          '</select></div>' +
+          '<div class="field"><label>Site Implementation</label><select id="f_impl">' +
+            GRYC.IMPLEMENTATION.map(function (t) { return '<option>' + esc(t) + '</option>'; }).join('') +
+          '</select></div>' +
+          '<div class="field"><label>DOE Building</label><select id="f_doe">' +
+            '<option>No</option><option>Yes</option></select></div>' +
+        '</div>' +
+        '<label class="check"><input type="checkbox" id="f_cc">' +
+          '<span class="ct"><strong>Childcare site</strong> — adds the Childcare Site Questions and the ' +
+          'childcare questionnaire to every participant</span></label>' +
+
+        '<h3 class="sec-title mt-3">Supervision and Management</h3>' +
+        '<div class="grid c3">' +
+          '<div class="field"><label>Name <span class="muted">(Last, First)</span></label>' +
+            '<input type="text" id="f_svname" placeholder="Last name, First name"></div>' +
+          '<div class="field"><label>Title</label><input type="text" id="f_svtitle" placeholder="Job title"></div>' +
+          '<div class="field"><label>Phone</label><input type="tel" id="f_svphone"></div>' +
+        '</div>' +
+        '<div class="field"><label>Email</label><input type="email" id="f_svemail"></div>' +
+
+        '<h3 class="sec-title mt-3">Job Duties</h3>' +
+        '<div class="grid c2">' +
+          '<div class="field"><label>Job Title</label>' +
+            '<input type="text" id="f_jtitle" placeholder="Job title the participants hold"></div>' +
+          '<div class="field"><label>Participants requested</label>' +
+            '<input type="number" id="f_req" min="0" placeholder="Number of participants"></div>' +
+        '</div>' +
+        '<div class="field"><label>Duties</label><textarea id="f_duties" rows="3" ' +
+          'placeholder="What the participants actually do at this site."></textarea></div>' +
+
+        '<h3 class="sec-title mt-3">Site Assignment Roster</h3>' +
+        '<p class="small muted">One row per youth. Leave it blank if the GRYC office loads the roster for ' +
+          'you — you can add them later from the site’s Participants tab.</p>' +
+        GRYC.pgridHTML('regppl'),
+      onOk: function (root) {
+        var name = GRYC.$('#f_name', root).value.trim();
+        var addr = GRYC.$('#f_addr', root).value.trim();
+        if (!name || !addr) { GRYC.toast('Worksite name and address are required.', 'bad'); return false; }
+
+        var isCC = GRYC.$('#f_cc', root).checked;
+
+        var sups = [];
+        var svn = GRYC.$('#f_svname', root).value.trim();
+        if (svn) {
+          sups.push({
+            id: GRYC.uid('sv'), name: svn,
+            title: GRYC.$('#f_svtitle', root).value.trim(),
+            email: GRYC.$('#f_svemail', root).value.trim(),
+            phone: GRYC.$('#f_svphone', root).value.trim(),
+            fax: '', area: '', room: '', trained: true,
+            siteRep: true, keyMgmt: true, signAttendance: true, isSupervisor: true
+          });
+        }
+
+        var got = GRYC.pgridRead(root, 'regppl');
+        if (got.incomplete) {
+          GRYC.toast('Every roster row needs a last name — ' + got.incomplete + ' row(s) highlighted.', 'bad');
+          return false;
+        }
+        var ppl = got.made;
+
+        var jtitle = GRYC.$('#f_jtitle', root).value.trim();
+        var jduties = GRYC.$('#f_duties', root).value.trim();
+
+        GRYC.db().sites.push({
+          id: GRYC.uid('s'), monitorId: user.id, emoji: isCC ? '🧸' : '🏢',
+          name: name, dycdId: GRYC.$('#f_dycd', root).value.trim(),
+          siteStatus: 'Approved-Active',
+          worksiteType: GRYC.$('#f_wtype', root).value,
+          address: addr,
+          room: GRYC.$('#f_room', root).value.trim(),
+          borough: GRYC.$('#f_boro', root).value,
+          zip: GRYC.$('#f_zip', root).value.trim(),
+          crossStreets: GRYC.$('#f_cross', root).value.trim(),
+          travel: GRYC.$('#f_travel', root).value.trim(),
+          cityAgency: 'No', agency: '',
+          doeBuilding: GRYC.$('#f_doe', root).value,
+          summerRising: 'No', summerRisingSite: '',
+          sector: GRYC.$('#f_sector', root).value,
+          industry: GRYC.$('#f_ind', root).value.trim(),
+          cityAffiliate: '',
+          implementation: GRYC.$('#f_impl', root).value,
+          description: '', website: '',
+          childcare: isCC, natureEnv: 'No',
+          ftEmployees: '', supervisingStaff: sups.length ? String(sups.length) : '',
+          supervisors: sups,
+          requested: +GRYC.$('#f_req', root).value || ppl.length,
+          ratioSup: sups.length ? String(sups.length) : '',
+          ratioPart: String(+GRYC.$('#f_req', root).value || ppl.length),
+          fullHours: '', hoursCommitment: '',
+          schedules: [], staggered: 'No',
+          jobs: (jtitle || jduties)
+            ? [{ category: isCC ? 'Child Care' : 'Other', title: jtitle, duties: jduties,
+                 restrictions: 'Refer to the Worksite Handbook for all guidance and regulations.',
+                 assigned: +GRYC.$('#f_req', root).value || ppl.length, must18: '', special: '' }]
+            : [],
+          cc: isCC ? {
+            facilityType: '', startDate: GRYC.PROGRAM.startDate, endDate: GRYC.PROGRAM.endDate,
+            childrenServed: '', trips: '', outdoor: '', screening: '', fingerprinted: '',
+            licenseType: 'SACC License Number', licenseNumber: '', licenseExp: '',
+            outOfCity: 'No'
+          } : null,
+          certs: { investigation: '', detail: '', licenseCopy: false, assurances: '' },
+          assessmentDefaults: null,
+          participants: ppl, log: [], weeks: {},
+          applicationOnFile: true
+        });
+        GRYC.save();
+        GRYC.toast('Worksite registered.', 'ok');
+        render();
+      }
+    });
+
+    /* New roster rows default to the borough chosen for the site itself, and
+       rows the monitor has not overridden follow it if that changes. */
+    var grid = GRYC.pgridWire(dlg, 'regppl', {
+      borough: function () { return GRYC.$('#f_boro', dlg).value; }
+    });
+    GRYC.$('#f_boro', dlg).addEventListener('change', grid.syncBorough);
+
+    GRYC.$$('.modal .check input[type=checkbox]').forEach(function (cb) {
+      cb.addEventListener('change', function () {
+        cb.closest('.check').classList.toggle('on', cb.checked);
+      });
+    });
+  });
+
+  $('#resetdemo').addEventListener('click', function () {
+    GRYC.confirmBox('Reset demo data?',
+      'This wipes any changes you made, including every W-9 and I-9 collected in this browser, and reloads the ' +
+      'sample sites, visits, assessments and mileage.',
+      'Reset', function () { GRYC.reset(); location.reload(); });
+  });
+
+  render();
+  renderNotes();
+  renderW9s();
+  renderI9s();
+})();
+</script>
+</body>
+</html>

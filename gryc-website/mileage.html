@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mileage · GRYC SYEP Site Monitor Portal</title>
+<link rel="icon" href="assets/images/gryc_logo.png">
+<link rel="stylesheet" href="assets/styles.css?v=15">
+</head>
+<body>
+
+<main class="page"><div class="wrap">
+
+  <div class="row between wrap-row mb-3">
+    <div>
+      <h1>Mileage Form — SYEP 2026</h1>
+      <p class="muted mb-0" id="sub"></p>
+    </div>
+    <div class="row no-print">
+      <button class="btn" id="locations">Saved locations</button>
+      <button class="btn" onclick="window.print()">Print / Save PDF</button>
+      <button class="btn primary" id="addtrip">+ Log a trip</button>
+    </div>
+  </div>
+
+  <div class="grid c4 mb-3 no-print" id="stats"></div>
+
+  <div id="root"></div>
+
+</div></main>
+
+<script src="assets/data.js?v=15"></script>
+<script src="assets/app.js?v=15"></script>
+<script>
+(function () {
+  var $ = GRYC.$, $$ = GRYC.$$, esc = GRYC.esc;
+  var user = GRYC.requireAuth();
+  if (!user) return;
+  GRYC.renderHeader('mileage');
+
+  $('#sub').textContent = user.name + ' · ' + GRYC.PROGRAM.cycle + ' · Rev. 6/25';
+
+  /* Date first, then the order the trips were logged — which is the order the
+     odometer runs, so Start Mileage reads down the page as the End Mileage of
+     the row above. The old tiebreak was the row id, and an id is a random
+     string: three trips on one day came out shuffled. */
+  function rows() {
+    var all = GRYC.myMileage();
+    var logged = {};
+    all.forEach(function (r, i) { logged[r.id] = i; });
+    return all.slice().sort(function (a, b) {
+      return a.date.localeCompare(b.date) || (logged[a.id] - logged[b.id]);
+    });
+  }
+
+  function lastRow() {
+    var r = rows();
+    return r.length ? r[r.length - 1] : null;
+  }
+
+  /* Recompute the total whenever both odometer readings are present. */
+  function computeTotal(row) {
+    var s = parseFloat(row.startMileage), e = parseFloat(row.endMileage);
+    if (isFinite(s) && isFinite(e) && e >= s) return (e - s).toFixed(1).replace(/\.0$/, '');
+    return row.total || '';
+  }
+
+  /* ---------------- location picker ---------------- */
+
+  /* A saved location may not have an address yet (GRYC HQ, for instance), so
+     fall back to its label — the From/To columns on the paper form take either. */
+  function locValue(l) { return l.address || l.label; }
+
+  function locationField(id, label, value) {
+    var locs = GRYC.myLocations();
+    var known = locs.some(function (l) { return locValue(l) === value; });
+    return '<div class="field mb-0"><label>' + esc(label) + '</label>' +
+      '<select id="' + id + '_sel">' +
+        '<option value="">— pick a location —</option>' +
+        locs.map(function (l) {
+          var v = locValue(l);
+          return '<option value="' + esc(v) + '"' + (v === value ? ' selected' : '') + '>' +
+            esc(l.label) + (l.address ? ' — ' + esc(l.address) : ' (no address on file)') + '</option>';
+        }).join('') +
+        '<option value="__custom"' + (value && !known ? ' selected' : '') + '>Other address…</option>' +
+      '</select>' +
+      '<input type="text" id="' + id + '_txt" class="mt-1' + (value && !known ? '' : ' hidden') + '" ' +
+        'placeholder="Street address" value="' + esc(value && !known ? value : '') + '">' +
+    '</div>';
+  }
+
+  function wireLocation(id, root) {
+    var sel = GRYC.$('#' + id + '_sel', root), txt = GRYC.$('#' + id + '_txt', root);
+    sel.addEventListener('change', function () {
+      var custom = sel.value === '__custom';
+      txt.classList.toggle('hidden', !custom);
+      if (custom) txt.focus();
+    });
+  }
+
+  function readLocation(id, root) {
+    var sel = GRYC.$('#' + id + '_sel', root), txt = GRYC.$('#' + id + '_txt', root);
+    return sel.value === '__custom' ? txt.value.trim() : sel.value;
+  }
+
+  /* ---------------- add / edit a trip ---------------- */
+
+  function tripModal(existing) {
+    var prev = lastRow();
+    var row = existing || {
+      date: GRYC.todayISO(),
+      startMileage: prev ? (prev.endMileage || '') : '',
+      from: prev ? (prev.to || '') : '',
+      to: '', endMileage: '', total: ''
+    };
+
+    GRYC.modal({
+      title: existing ? 'Edit trip' : 'Log a trip', wide: true,
+      okText: existing ? 'Save' : 'Add trip',
+      body:
+        '<div class="grid c3 mb-2">' +
+          '<div class="field mb-0"><label class="req">Date</label>' +
+            '<input type="date" id="t_date" value="' + esc(row.date) + '"></div>' +
+          '<div class="field mb-0"><label>Start Mileage</label>' +
+            '<input type="number" step="0.1" id="t_start" value="' + esc(row.startMileage) + '" ' +
+            'placeholder="Odometer reading"></div>' +
+          '<div class="field mb-0"><label>End Mileage</label>' +
+            '<input type="number" step="0.1" id="t_end" value="' + esc(row.endMileage) + '" ' +
+            'placeholder="Odometer reading"></div>' +
+        '</div>' +
+        '<div class="grid c2 mb-2">' +
+          locationField('t_from', 'From', row.from) +
+          locationField('t_to', 'To', row.to) +
+        '</div>' +
+        '<div class="field mb-0"><label>Total Mileage</label>' +
+          '<input type="number" step="0.1" id="t_total" value="' + esc(row.total) + '">' +
+          '<div class="hint" id="t_hint">Fills in automatically from the odometer readings — or type it ' +
+            'straight in if you only tracked trip distance.</div></div>' +
+        (!existing && prev
+          ? '<p class="hint mt-2 mb-0">Carried over from your last trip: started at <strong>' +
+            esc(prev.to || '—') + '</strong>' + (prev.endMileage ? ' at ' + esc(prev.endMileage) + ' mi' : '') + '.</p>'
+          : ''),
+      onOk: function (r) {
+        var from = readLocation('t_from', r), to = readLocation('t_to', r);
+        if (!from || !to) { GRYC.toast('From and To are both required.', 'bad'); return false; }
+        var next = {
+          date: GRYC.$('#t_date', r).value,
+          startMileage: GRYC.$('#t_start', r).value.trim(),
+          from: from, to: to,
+          endMileage: GRYC.$('#t_end', r).value.trim(),
+          total: GRYC.$('#t_total', r).value.trim()
+        };
+        next.total = next.total || computeTotal(next);
+
+        if (existing) {
+          ['date', 'startMileage', 'from', 'to', 'endMileage', 'total'].forEach(function (k) { existing[k] = next[k]; });
+          GRYC.save();
+          GRYC.toast('Trip updated.', 'ok');
+        } else {
+          GRYC.addMileage(next);
+          GRYC.toast('Trip logged.', 'ok');
+        }
+        render();
+      }
+    });
+
+    wireLocation('t_from', document);
+    wireLocation('t_to', document);
+
+    function sync() {
+      var t = computeTotal({
+        startMileage: $('#t_start').value,
+        endMileage: $('#t_end').value,
+        total: ''
+      });
+      if (t) $('#t_total').value = t;
+    }
+    $('#t_start').addEventListener('input', sync);
+    $('#t_end').addEventListener('input', sync);
+  }
+
+  /* ---------------- saved locations ---------------- */
+
+  function locationsModal() {
+    var saved = GRYC.db().locations.filter(function (l) { return l.monitorId === user.id; });
+    GRYC.modal({
+      title: 'Saved locations', wide: true, okText: 'Save',
+      body:
+        '<p class="small">These show up in the From/To dropdowns alongside your worksites. Worksite addresses ' +
+          'are pulled in automatically from the Worksite Application.</p>' +
+        '<div class="tbl-wrap"><table class="tbl" id="loctbl"><thead><tr><th>Label</th><th>Address</th><th></th>' +
+          '</tr></thead><tbody>' +
+          saved.map(function (l) {
+            return '<tr data-locid="' + esc(l.id) + '">' +
+              '<td><input type="text" data-lf="label" value="' + esc(l.label) + '"></td>' +
+              '<td><input type="text" data-lf="address" value="' + esc(l.address) + '"></td>' +
+              '<td class="right"><button class="btn sm ghost danger" data-delloc>×</button></td></tr>';
+          }).join('') + '</tbody></table></div>' +
+        '<button class="btn sm mt-2" id="addloc">+ Add location</button>' +
+        '<div class="mt-3"><div class="lbl">From your worksites</div>' +
+          GRYC.mySites().filter(function (s) { return s.address; }).map(function (s) {
+            return '<div class="row between small" style="padding:4px 0;border-bottom:1px solid var(--line-2)">' +
+              '<span>' + esc(s.name) + '</span><span class="muted">' + esc(s.address) + '</span></div>';
+          }).join('') || '<p class="muted small mb-0">No worksite addresses on file yet.</p>' +
+        '</div>',
+      onOk: function (r) {
+        var db = GRYC.db();
+        var kept = [];
+        GRYC.$$('#loctbl tbody tr', r).forEach(function (tr) {
+          var label = GRYC.$('[data-lf=label]', tr).value.trim();
+          var address = GRYC.$('[data-lf=address]', tr).value.trim();
+          if (!label && !address) return;
+          kept.push({
+            id: tr.dataset.locid || GRYC.uid('loc'),
+            monitorId: user.id, label: label || address, address: address, kind: 'other'
+          });
+        });
+        db.locations = db.locations.filter(function (l) { return l.monitorId !== user.id; }).concat(kept);
+        GRYC.save();
+        GRYC.toast('Locations saved.', 'ok');
+        render();
+      }
+    });
+
+    function wireDel(root) {
+      GRYC.$$('[data-delloc]', root).forEach(function (b) {
+        b.onclick = function () { b.closest('tr').remove(); };
+      });
+    }
+    wireDel(document);
+    $('#addloc').addEventListener('click', function () {
+      $('#loctbl tbody').insertAdjacentHTML('beforeend',
+        '<tr><td><input type="text" data-lf="label" placeholder="What you call this stop"></td>' +
+        '<td><input type="text" data-lf="address" placeholder="Street address"></td>' +
+        '<td class="right"><button class="btn sm ghost danger" data-delloc>×</button></td></tr>');
+      wireDel(document);
+    });
+  }
+
+  /* ---------------- render ---------------- */
+
+  function render() {
+    var all = rows();
+    var total = GRYC.mileageTotal(all);
+
+    var thisWeek = GRYC.week(GRYC.currentWeek());
+    var wkRows = all.filter(function (r) { return r.date >= thisWeek.start && r.date <= thisWeek.ending; });
+    var days = {};
+    all.forEach(function (r) { days[r.date] = true; });
+
+    $('#stats').innerHTML = [
+      ['', all.length, 'Trips logged'],
+      ['green', GRYC.mileageTotal(wkRows) || '—', 'Miles this week'],
+      ['pink', total || '—', 'Miles this summer'],
+      ['yellow', Object.keys(days).length, 'Days driven']
+    ].map(function (s) {
+      return '<div class="card stat ' + s[0] + '"><div class="bar"></div>' +
+        '<div class="n">' + esc(s[1]) + '</div><div class="l">' + esc(s[2]) + '</div></div>';
+    }).join('');
+
+    /* Blank rows so the printed page looks like the paper form. */
+    var padRows = Math.max(0, 12 - all.length);
+    var blanks = '';
+    for (var i = 0; i < padRows; i++) {
+      blanks += '<tr class="blankrow"><td>&nbsp;</td><td></td><td></td><td></td><td></td><td></td>' +
+        '<td class="no-print"></td></tr>';
+    }
+
+    var lastDate = null;
+
+    $('#root').innerHTML =
+      '<div class="card">' +
+        '<div class="card-h"><h2>Mileage</h2><div class="spacer"></div>' +
+          '<span class="badge">' + esc(GRYC.PROGRAM.provider) + '</span></div>' +
+        '<div class="tbl-wrap"><table class="tbl mileage"><thead><tr>' +
+          '<th>Date</th><th>Start Mileage</th><th>From</th><th>To</th>' +
+          '<th>End Mileage</th><th>Total Mileage</th><th class="no-print"></th>' +
+        '</tr></thead><tbody>' +
+          all.map(function (r) {
+            var newDay = r.date !== lastDate;
+            lastDate = r.date;
+            return '<tr>' +
+              '<td class="nowrap' + (newDay ? ' strong' : ' muted') + '">' +
+                (newDay ? esc(GRYC.fmtSlash(r.date)) : '〃') + '</td>' +
+              '<td class="mono">' + esc(r.startMileage || '') + '</td>' +
+              '<td>' + esc(r.from) + '</td>' +
+              '<td>' + esc(r.to) + '</td>' +
+              '<td class="mono">' + esc(r.endMileage || '') + '</td>' +
+              '<td class="mono strong">' + esc(r.total || '') + '</td>' +
+              '<td class="right no-print nowrap">' +
+                '<button class="btn sm ghost" data-edit="' + esc(r.id) + '">Edit</button>' +
+                '<button class="btn sm ghost danger" data-del="' + esc(r.id) + '">×</button></td>' +
+            '</tr>';
+          }).join('') + blanks +
+          (all.length
+            ? '<tr class="totalrow"><td colspan="5" class="right strong">Total</td>' +
+              '<td class="mono strong">' + esc(total || '') + '</td><td class="no-print"></td></tr>'
+            : '') +
+        '</tbody></table></div>' +
+        (all.length ? '' :
+          '<div class="empty"><div class="big">🚗</div><p class="strong">No trips logged yet</p>' +
+          '<p class="muted">Log a trip when you leave for a site — From and To default to where your last ' +
+          'trip ended.</p></div>') +
+        '<div class="card-b sigfoot">' +
+          '<div class="grid c2">' +
+            '<div>' +
+              '<div class="sigrow"><span class="fsl">Employee’s Name:</span><span class="fv">' +
+                esc(user.name) + '</span></div>' +
+              '<div class="sigrow"><span class="fsl">Employee’s Signature:</span><span class="fv"></span></div>' +
+            '</div>' +
+            '<div>' +
+              '<div class="sigrow"><span class="fsl">Supervisor’s Name:</span><span class="fv"></span></div>' +
+              '<div class="sigrow"><span class="fsl">Supervisor’s Signature:</span><span class="fv"></span></div>' +
+            '</div>' +
+          '</div>' +
+          '<div class="tiny muted mt-2">Rev. 6/25</div>' +
+        '</div>' +
+      '</div>';
+
+    $$('[data-edit]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        tripModal(GRYC.myMileage().filter(function (m) { return m.id === b.dataset.edit; })[0]);
+      });
+    });
+    $$('[data-del]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        GRYC.confirmBox('Delete trip?', 'This row will be removed from the mileage form.', 'Delete', function () {
+          var db = GRYC.db();
+          db.mileage = db.mileage.filter(function (m) { return m.id !== b.dataset.del; });
+          GRYC.save(); GRYC.toast('Trip deleted.'); render();
+        });
+      });
+    });
+  }
+
+  $('#addtrip').addEventListener('click', function () { tripModal(null); });
+  $('#locations').addEventListener('click', locationsModal);
+
+  render();
+})();
+</script>
+</body>
+</html>

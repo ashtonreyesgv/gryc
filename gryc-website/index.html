@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · GRYC SYEP Site Monitor Portal</title>
+<link rel="icon" href="assets/images/gryc_logo.png">
+<link rel="stylesheet" href="assets/styles.css?v=15">
+</head>
+<body>
+
+<div class="login-page">
+
+  <div class="login-art">
+    <h2>Put the worksite<br>assessment packet<br>on your phone.</h2>
+    <p>Check in, collect timesheets, run evaluations and sign off — all from the site, without carrying a binder.</p>
+    <ul>
+      <li><span class="k">✓</span><span>Timestamped check-in / check-out replaces the paper monitoring log</span></li>
+      <li><span class="k">✓</span><span>Worksite assessment as a guided 3-step form with on-screen signatures</span></li>
+      <li><span class="k">✓</span><span>Week 3 and Week 6 participant evaluations tracked per youth</span></li>
+      <li><span class="k">✓</span><span>See at a glance which sites still owe you paperwork</span></li>
+    </ul>
+  </div>
+
+  <div class="login-form">
+    <div class="inner">
+      <img class="login-logo" src="assets/images/gryc_logo.png" alt="Greater Ridgewood Youth Council">
+      <h1>Sign in</h1>
+      <p class="muted mb-3">Greater Ridgewood Youth Council · SYEP Summer 2026</p>
+
+      <form id="loginform" novalidate>
+        <div class="field">
+          <label for="email">Email</label>
+          <input type="email" id="email" autocomplete="username" value="ashtonreyes@gryc.org">
+        </div>
+        <div class="field">
+          <label for="password">Password</label>
+          <input type="password" id="password" autocomplete="current-password" value="monitor">
+        </div>
+        <div id="loginerr" class="err hidden"></div>
+        <button type="submit" class="btn primary lg block mt-2">Sign in</button>
+      </form>
+
+      <div class="demo-note">
+        <strong>Demo build <span class="mono" id="build">?</span>.</strong>
+        Use <span class="mono">ashtonreyes@gryc.org</span> / <span class="mono">monitor</span>.
+        All data is stored locally in this browser.
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script src="assets/data.js?v=15"></script>
+<script src="assets/app.js?v=15"></script>
+<script>
+(function () {
+  GRYC.$('#build').textContent = GRYC.BUILD;
+  if (GRYC.currentUser()) { location.replace('dashboard.html'); return; }
+
+  GRYC.$('#loginform').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var err = GRYC.$('#loginerr');
+    var u = GRYC.login(GRYC.$('#email').value, GRYC.$('#password').value);
+    if (!u) {
+      err.textContent = 'That email and password combination was not recognized.';
+      err.classList.remove('hidden');
+      return;
+    }
+    location.href = 'dashboard.html';
+  });
+})();
+</script>
+</body>
+</html>

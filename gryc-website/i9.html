@@ -1,0 +1,1465 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Form I-9 · GRYC SYEP Site Monitor Portal</title>
+<link rel="icon" href="assets/images/gryc_logo.png">
+<link rel="stylesheet" href="assets/styles.css?v=15">
+</head>
+<body>
+
+<main class="page"><div class="wrap"><div class="formwrap">
+  <div class="crumb no-print" id="crumb"></div>
+  <div id="root"></div>
+  <div id="confirm"></div>
+</div></div></main>
+
+<script src="assets/data.js?v=15"></script>
+<script src="assets/app.js?v=15"></script>
+<script>
+/* ==========================================================================
+   Form I-9 — Employment Eligibility Verification (Edition 01/20/25)
+
+   Signed twice, by two people, days apart:
+
+     Section 1  the employee — who they are and their citizenship or
+                immigration status. Steps 1–3; a preparer or translator who
+                helped signs Supplement A on the same step.
+     Section 2  the employer or authorized representative — the documents
+                the employee chose to show, examined in the original.
+                Steps 4–5, open once Section 1 is signed.
+
+   Built to the electronic-I-9 rules in 8 CFR 274a.2(e)–(i):
+
+     · every attestation word for word (assets/data.js), each with a box
+       the signer ticks to acknowledge they read it, and the signature
+       affixed at the moment of signing;
+     · a record of who signed and how, and an audit trail of every access
+       and every change;
+     · fingerprints that catch alteration after either signature;
+     · a printed confirmation for the employee on request, and legible
+       hard copies of the form, Supplement A and the record.
+   ========================================================================== */
+(function () {
+  var $ = GRYC.$, $$ = GRYC.$$, esc = GRYC.esc;
+  var user = GRYC.requireAuth();
+  if (!user) return;
+  GRYC.renderHeader('sites');
+
+  $('#crumb').innerHTML = '<a href="dashboard.html">My Sites</a> <span class="muted">/</span> Form I-9';
+
+  var id = GRYC.param('id');
+  var rec = id ? GRYC.i9(id) : null;
+  if (rec && rec.monitorId !== user.id) rec = null;   /* SSNs and status are not for every account */
+  if (id && !rec) {
+    $('#root').innerHTML = '<div class="card"><div class="empty"><p>That I-9 was not found.</p>' +
+      '<a class="btn" href="dashboard.html">Back</a></div></div>';
+    return;
+  }
+
+  var INSTRUCTIONS_URL = 'https://www.uscis.gov/sites/default/files/document/forms/i-9instr.pdf';
+  var EVERIFY = GRYC.I9_EVERIFY;
+  var STEPS = [
+    { label: 'Employee information',  page: 'Section 1' },
+    { label: 'Citizenship or status', page: 'Section 1' },
+    { label: 'Review & sign',         page: 'Section 1 · Supp. A' },
+    { label: 'Documents',             page: 'Section 2' },
+    { label: 'Review & sign',         page: 'Section 2' }
+  ];
+  var STATUS_SHORT = {
+    citizen: 'U.S. citizen', national: 'Noncitizen national',
+    lpr: 'Lawful permanent resident', alien: 'Alien authorized to work'
+  };
+
+  var sigEmp = null, sigPrep = null, sigEr = null;
+  var sigEmpOpts = {}, sigPrepOpts = {}, sigErOpts = {};
+  var printHooked = false, printingConfirm = false;
+
+  /* ======================================================================
+     working copy
+     ====================================================================== */
+
+  function blankDoc() { return { title: '', issuer: '', number: '', expiry: '' }; }
+  function blankPreparer() {
+    return { lastName: '', firstName: '', middleInitial: '', address: '', city: '', state: 'NY', zip: '',
+             signature: '', signedAt: '', signedDate: '' };
+  }
+
+  function blank() {
+    var parts = String(user.name || '').trim().split(/\s+/);
+    var repLast = parts.length > 1 ? parts.pop() : (parts[0] || '');
+    return {
+      id: GRYC.uid('i9'), monitorId: user.id, status: 'draft',
+      edition: GRYC.I9_EDITION,
+      employer: JSON.parse(JSON.stringify(GRYC.I9_EMPLOYER)),
+
+      /* Section 1 */
+      lastName: '', firstName: '', middleInitial: '', otherLastNames: '',
+      address: '', apt: '', city: '', state: 'NY', zip: '',
+      dob: '', ssn: '', email: '', phone: '',
+      citizenship: '', lprNumber: '', workUntil: '', workUntilNA: false,
+      alienIdType: '', alienA: '', i94: '', passportNo: '', passportCountry: '',
+      helper: 'none', preparer: blankPreparer(),
+      s1Identity: '', s1Ack: false, prepAck: false,
+      employeeSig: '', s1SignedAt: '', s1SignedDate: '', s1Hash: '', s1By: null, s1Device: '',
+
+      /* Section 2 — the representative starts as the signed-in account */
+      firstDay: '', docPath: '',
+      listA: [blankDoc(), blankDoc(), blankDoc()], listB: blankDoc(), listC: blankDoc(),
+      additionalInfo: '', altProcedure: false,
+      repLast: repLast, repFirst: parts.length ? parts.join(' ') : '', repTitle: user.title || '',
+      s2Ack: false, employerSig: '', s2SignedAt: '', s2SignedDate: '', s2Hash: '', s2By: null, s2Device: '',
+
+      createdAt: '', updatedAt: '', audit: []
+    };
+  }
+
+  var saved = !!rec;
+  var form = rec ? JSON.parse(JSON.stringify(rec)) : blank();
+
+  /* A draft may predate a field. Anything signed is left exactly as signed. */
+  if (form.status === 'draft') {
+    (function backfillForm() {
+      var b = blank();
+      Object.keys(b).forEach(function (k) { if (form[k] === undefined) form[k] = b[k]; });
+    })();
+  }
+
+  var step = form.status === 'draft' ? 1 : 4;
+
+  /* Every load is an occasion of access, so every load goes in the log. */
+  if (saved) {
+    GRYC.logAccess(form, form.status === 'complete' ? 'Viewed'
+      : form.status === 'section1' ? 'Opened for Section 2' : 'Opened the draft');
+    GRYC.putI9(form);
+  }
+
+  /* The first save creates the record and starts its log. */
+  function persist(what, detail) {
+    var now = new Date().toISOString();
+    if (!saved) {
+      form.createdAt = now;
+      GRYC.logAccess(form, 'Started', 'New I-9 for ' + form.employer.name);
+      saved = true;
+      history.replaceState(null, '', 'i9.html?id=' + form.id);
+    }
+    if (what) GRYC.logAccess(form, what, detail);
+    form.updatedAt = now;
+    GRYC.putI9(form);
+  }
+
+  function touched() {
+    return !!(form.lastName || form.firstName || form.address || form.city || form.dob || form.ssn || form.citizenship);
+  }
+
+  /* ======================================================================
+     helpers
+     ====================================================================== */
+
+  function norm(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); }
+
+  /* 2026-07-06 -> 07/06/2026, the way the form asks for dates. */
+  function fmtI9Date(iso) {
+    if (!iso) return '';
+    var p = iso.split('-');
+    return p[1] + '/' + p[2] + '/' + p[0];
+  }
+
+  function stamp(iso) {
+    if (!iso) return '—';
+    return new Date(iso).toLocaleString('en-US', {
+      month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit'
+    });
+  }
+
+  function fmtSsn(d) {
+    d = String(d || '');
+    if (d.length > 5) return d.slice(0, 3) + '-' + d.slice(3, 5) + '-' + d.slice(5);
+    if (d.length > 3) return d.slice(0, 3) + '-' + d.slice(3);
+    return d;
+  }
+
+  /* Structural checks. An ITIN starts with 9, and the instructions say an
+     ITIN doesn't go in this box. */
+  function ssnProblem(d) {
+    if (d.length !== 9) return 'must be 9 digits';
+    if (d.charAt(0) === '9') return 'starts with 9 — that is an ITIN, which doesn’t go here';
+    if (/^(000|666)/.test(d)) return 'can’t start with 000 or 666';
+    if (d.slice(3, 5) === '00') return 'can’t have 00 as its middle two digits';
+    if (d.slice(5) === '0000') return 'can’t end in 0000';
+    return '';
+  }
+
+  function ageToday() { return form.dob ? GRYC.age(form.dob, GRYC.todayISO()) : null; }
+  function isMinor() { var a = ageToday(); return a !== null && a < 18; }
+  /* M-274 §4.2, and not for E-Verify employers. */
+  function minorAllowed() { return !EVERIFY && isMinor(); }
+
+  function prepName(f) {
+    var p = f.preparer || {};
+    return [p.firstName, p.lastName].filter(Boolean).join(' ');
+  }
+  function s1Signer(f) {
+    return f.helper === 'minor'
+      ? prepName(f) + ' (parent or legal guardian)'
+      : [f.firstName, f.lastName].filter(Boolean).join(' ');
+  }
+  function repName(f) {
+    return [f.repFirst, f.repLast].filter(Boolean).join(' ') + (f.repTitle ? ', ' + f.repTitle : '');
+  }
+  function s1IdentityText(f) {
+    var by = f.s1By || { name: user.name, email: user.email };
+    if (f.s1Identity === 'self') return 'Signed by the account holder, signed in as ' + by.email;
+    if (f.s1Identity === 'inperson') return 'Signed in person on this device, with ' + by.name + ' present';
+    return '—';
+  }
+  function statusLine(f) {
+    var s = STATUS_SHORT[f.citizenship] || '';
+    if (f.citizenship === 'alien') s += f.workUntilNA ? ' (no expiration)' : f.workUntil ? ' until ' + GRYC.fmtDate(f.workUntil) : '';
+    return s;
+  }
+
+  /* A typed signature has to carry the signer's own first and last name. */
+  function typedMatches(v, first, last) {
+    if (!v || v.indexOf('typed:') !== 0) return true;
+    var t = norm(v.slice(6)).split(' ');
+    var l = norm(last).split(' ').pop(), fi = norm(first).split(' ')[0];
+    return !!l && !!fi && t.indexOf(l) > -1 && t.indexOf(fi) > -1;
+  }
+
+  function sigHTML(v) {
+    if (v === 'minor') return '<span class="i9-minorsig">' + esc(GRYC.I9_MINOR) + '</span>';
+    return v ? GRYC.sigView(v) : '';
+  }
+
+  /* `last` drops the gap under the final card of a step. */
+  function card(title, tag, inner, last) {
+    return '<div class="card' + (last ? '' : ' mb-2') + '"><div class="card-h"><h2>' + esc(title) + '</h2>' +
+      '<div class="spacer"></div><span class="badge">' + esc(tag) + '</span></div>' +
+      '<div class="card-b">' + inner + '</div></div>';
+  }
+
+  /* `label` and `o.hint` are markup written in this file; values are escaped. */
+  function field(fid, label, value, o) {
+    o = o || {};
+    return '<div class="field' + (o.mb0 ? ' mb-0' : '') + '">' +
+      '<label for="' + fid + '"' + (o.req ? ' class="req"' : '') + '>' + label + '</label>' +
+      '<input type="' + (o.type || 'text') + '" id="' + fid + '" value="' + esc(value || '') + '"' + (o.attrs || '') + '>' +
+      (o.hint ? '<div class="hint">' + o.hint + '</div>' : '') + '</div>';
+  }
+
+  function stateSelect(fid, value, o) {
+    o = o || {};
+    return '<div class="field' + (o.mb0 ? ' mb-0' : '') + '"><label for="' + fid + '" class="req">State</label>' +
+      '<select id="' + fid + '">' + GRYC.US_STATES.map(function (s) {
+        return '<option' + (value === s ? ' selected' : '') + '>' + s + '</option>';
+      }).join('') + '</select></div>';
+  }
+
+  function radioRow(name, value, on, title, sub) {
+    return '<label class="check' + (on ? ' on' : '') + '">' +
+      '<input type="radio" name="' + name + '" value="' + value + '"' + (on ? ' checked' : '') + '>' +
+      '<span class="ct"><strong>' + esc(title) + '</strong>' +
+      (sub ? '<br><span class="small muted">' + esc(sub) + '</span>' : '') + '</span></label>';
+  }
+
+  /* The box 8 CFR 274a.2(h) asks for: the signer acknowledges having read
+     the attestation before signing it. */
+  function ackBox(fid, on, text) {
+    return '<label class="check' + (on ? ' on' : '') + '">' +
+      '<input type="checkbox" id="' + fid + '"' + (on ? ' checked' : '') + '>' +
+      '<span class="ct"><strong>' + esc(text) + '</strong></span></label>';
+  }
+
+  function sigPair(fid, label) {
+    return '<div class="grid signpair">' +
+      '<div><div class="lbl req">' + esc(label) + '</div><div id="' + fid + '"></div></div>' +
+      '<div><div class="lbl">Today’s date</div><div class="readout">' + esc(fmtI9Date(GRYC.todayISO())) + '</div></div>' +
+    '</div>';
+  }
+
+  /* Anything changed above a signature invalidates it. */
+  function unsign(pad) {
+    if (pad && pad.isSigned()) {
+      pad.clear();
+      GRYC.toast('Sign again — the signature has to be the last thing on the form.');
+    }
+  }
+
+  function wireCheck(fid, onChange) {
+    var el = $('#' + fid);
+    if (!el) return;
+    el.addEventListener('change', function () {
+      el.closest('.check').classList.toggle('on', el.checked);
+      if (onChange) onChange(el.checked);
+    });
+  }
+
+  /* ======================================================================
+     THE FORM — page 1 of Form I-9, and Supplement A, box for box
+
+     Labels are the form's wording; the answers sit where a pen would put
+     them. `o.only: 's1'` stops after Section 1, for the employee's review
+     and for their printed confirmation.
+     ====================================================================== */
+
+  function cell(label, value, cls) {
+    return '<div class="c' + (cls ? ' ' + cls : '') + '"><div class="lab">' + label + '</div>' +
+      '<div class="val">' + (value ? esc(value) : '&nbsp;') + '</div></div>';
+  }
+  function sigCell(label, value) {
+    return '<div class="c"><div class="lab">' + label + '</div><div class="sv">' + sigHTML(value) + '</div></div>';
+  }
+
+  function head(title, sub) {
+    return '<div class="i9-head">' +
+      '<div class="i9-t">' + title +
+        '<span>Department of Homeland Security</span><span>U.S. Citizenship and Immigration Services</span></div>' +
+      '<div class="i9-id"><span class="ag">USCIS</span><span class="n">Form I-9</span>' +
+        (sub ? '<span class="ag">' + sub + '</span>' : '') + '</div>' +
+      '<div class="i9-omb">' + esc(GRYC.I9_OMB) + '<br>Expires ' + esc(GRYC.I9_EXPIRES) + '</div>' +
+    '</div>';
+  }
+
+  function i9Doc(f, o) {
+    o = o || {};
+    var box = GRYC.box, alien = f.citizenship === 'alien';
+
+    /* Masked and full copies of the SSN sit side by side; the page shows
+       one, print shows the full number unless the copy is marked keep-mask. */
+    function ssnCells() {
+      var d = String(f.ssn || '');
+      function cells(mask) {
+        var i = 0;
+        return [3, 2, 4].map(function (g, gi) {
+          var s = '';
+          for (var k = 0; k < g; k++, i++) {
+            var ch = d.charAt(i);
+            if (mask && ch && i < d.length - 4) ch = '•';
+            s += '<i>' + esc(ch) + '</i>';
+          }
+          return (gi ? '<span class="dash">–</span>' : '') + '<span class="g">' + s + '</span>';
+        }).join('');
+      }
+      if (!d) return '<div class="tin">' + cells(false) + '</div>';
+      return '<div class="tin tin-mask">' + cells(true) + '</div><div class="tin tin-full">' + cells(false) + '</div>';
+    }
+
+    var html =
+      head('<b>Employment Eligibility Verification</b>') +
+      '<div class="i9-notice"><b>START HERE:</b> ' + esc(GRYC.I9_START_HERE) + '</div>' +
+      '<div class="i9-notice"><b>ANTI-DISCRIMINATION NOTICE:</b> ' + esc(GRYC.I9_ANTI_DISCRIMINATION) + '</div>' +
+
+      '<div class="i9-bar"><b>Section 1. Employee Information and Attestation:</b> ' + esc(GRYC.I9_S1_HEAD) + '</div>' +
+      '<div class="i9-row r-name">' +
+        cell('Last Name (Family Name)', f.lastName) + cell('First Name (Given Name)', f.firstName) +
+        cell('Middle Initial (if any)', f.middleInitial) + cell('Other Last Names Used (if any)', f.otherLastNames) +
+      '</div>' +
+      '<div class="i9-row r-addr">' +
+        cell('Address (Street Number and Name)', f.address) + cell('Apt. Number (if any)', f.apt) +
+        cell('City or Town', f.city) + cell('State', f.state) + cell('ZIP Code', f.zip) +
+      '</div>' +
+      '<div class="i9-row r-dob">' +
+        cell('Date of Birth (mm/dd/yyyy)', fmtI9Date(f.dob)) +
+        '<div class="c"><div class="lab">U.S. Social Security Number</div>' + ssnCells() + '</div>' +
+        cell('Employee\'s Email Address', f.email) + cell('Employee\'s Telephone Number', f.phone) +
+      '</div>' +
+      '<div class="i9-row r-attest">' +
+        '<div class="c i9-aware">' + esc(GRYC.I9_S1_ATTEST) + '</div>' +
+        '<div class="c">' +
+          '<div class="lab">' + esc(GRYC.I9_STATUS_PROMPT) + '</div>' +
+          GRYC.I9_STATUSES.map(function (s, i) {
+            var extra = '';
+            if (s.id === 'lpr') {
+              extra = ' <span class="i9-fill">' + esc(f.citizenship === 'lpr' ? f.lprNumber : '') + '</span>';
+            }
+            if (s.id === 'alien') {
+              extra = ' <span class="i9-fill">' +
+                esc(alien ? (f.workUntilNA ? 'N/A' : fmtI9Date(f.workUntil)) : '') + '</span> (exp. date, if any)';
+            }
+            return '<div class="i9-st">' + box(f.citizenship === s.id) + ' <span>' + (i + 1) + '. ' +
+              esc(s.text) + '</span>' + extra + '</div>';
+          }).join('') +
+          '<div class="i9-alien"><div class="lab">If you check Item Number 4., enter one of these:</div>' +
+            '<div class="i9-alien-g">' +
+              cell('USCIS A-Number', alien && f.alienIdType === 'a' ? f.alienA : '') +
+              '<div class="j">OR</div>' +
+              cell('Form I-94 Admission Number', alien && f.alienIdType === 'i94' ? f.i94 : '') +
+              '<div class="j">OR</div>' +
+              cell('Foreign Passport Number and Country of Issuance', alien && f.alienIdType === 'passport'
+                ? [f.passportNo, f.passportCountry].filter(Boolean).join(', ') : '') +
+            '</div></div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="i9-row r-sig">' +
+        sigCell('Signature of Employee', f.employeeSig) +
+        cell('Today\'s Date (mm/dd/yyyy)', fmtI9Date(f.s1SignedDate)) +
+      '</div>' +
+      '<div class="i9-small">' + esc(GRYC.I9_PREPARER_NOTE) + '</div>';
+
+    if (o.only === 's1') return html;
+
+    var isA = f.docPath === 'A', isBC = f.docPath === 'BC';
+    function docVals(d) { d = d || {}; return [d.title, d.issuer, d.number, fmtI9Date(d.expiry)]; }
+    function v(x) { return '<div class="c"><div class="val">' + (x ? esc(x) : '&nbsp;') + '</div></div>'; }
+    var a1 = docVals(isA ? f.listA[0] : null), b = docVals(isBC ? f.listB : null), c = docVals(isBC ? f.listC : null);
+    var rows = ['Issuing Authority', 'Document Number (if any)', 'Expiration Date (if any)'];
+    var emp = f.employer || GRYC.I9_EMPLOYER;
+
+    html +=
+      '<div class="i9-bar"><b>Section 2. Employer Review and Verification:</b> ' + esc(GRYC.I9_S2_HEAD) + '</div>' +
+      '<div class="i9-docwrap"><div class="i9-docs">' +
+        '<div class="c hd"></div><div class="c hd">List A</div>' +
+        '<div class="c hd"><span class="j">OR</span> List B</div><div class="c hd"><span class="j">AND</span> List C</div>' +
+        ['Document Title 1'].concat(rows).map(function (l, i) {
+          return '<div class="c rl">' + l + '</div>' + v(a1[i]) + v(b[i]) + v(c[i]);
+        }).join('') +
+        [1, 2].map(function (k) {
+          var d = docVals(isA ? f.listA[k] : null);
+          return ['Document Title ' + (k + 1) + ' (if any)'].concat(rows).map(function (l, i) {
+            var addl = k === 1 && i === 0
+              ? '<div class="c i9-add"><div class="lab">Additional Information</div>' +
+                '<div class="val">' + (f.additionalInfo ? esc(f.additionalInfo) : '&nbsp;') + '</div>' +
+                '<div class="i9-alt">' + box(f.altProcedure) + ' ' + esc(GRYC.I9_ALT_PROCEDURE) + '</div></div>'
+              : '';
+            return '<div class="c rl">' + l + '</div>' + v(d[i]) + addl;
+          }).join('');
+        }).join('') +
+      '</div></div>' +
+      '<div class="i9-cert"><b>Certification:</b> ' + esc(GRYC.I9_S2_CERT) + '</div>' +
+      '<div class="i9-row r-first"><div class="c"><span class="lab">First Day of Employment (mm/dd/yyyy):</span> ' +
+        '<span class="val">' + esc(fmtI9Date(f.firstDay)) + '</span></div></div>' +
+      '<div class="i9-row r-rep">' +
+        cell('Last Name, First Name and Title of Employer or Authorized Representative',
+          [f.repLast, f.repFirst, f.repTitle].filter(Boolean).join(', ')) +
+        sigCell('Signature of Employer or Authorized Representative', f.employerSig) +
+        cell('Today\'s Date (mm/dd/yyyy)', fmtI9Date(f.s2SignedDate)) +
+      '</div>' +
+      '<div class="i9-row r-emp">' +
+        cell('Employer\'s Business or Organization Name', emp.name) +
+        cell('Employer\'s Business or Organization Address, City or Town, State, ZIP Code', emp.address + ', ' + emp.city) +
+      '</div>' +
+      '<div class="i9-foot"><span>For reverification or rehire, complete Supplement B, Reverification and Rehire on Page 4.</span>' +
+        '<span>Form I-9 Edition ' + esc(f.edition) + ' &nbsp; Page 1 of 4</span></div>';
+    return html;
+  }
+
+  function suppAHTML(f) {
+    var p = f.preparer || {};
+    return head('<b>Supplement A,</b><b>Preparer and/or Translator Certification for Section 1</b>', 'Supplement A') +
+      '<div class="i9-row r-name3">' +
+        cell('Last Name (Family Name) from Section 1.', f.lastName) +
+        cell('First Name (Given Name) from Section 1.', f.firstName) +
+        cell('Middle initial (if any) from Section 1.', f.middleInitial) +
+      '</div>' +
+      '<div class="i9-notice"><b>Instructions:</b> ' + esc(GRYC.I9_SUPP_A_INSTRUCTIONS) + '</div>' +
+      '<div class="i9-bar">' + esc(GRYC.I9_PREPARER_ATTEST) + '</div>' +
+      '<div class="i9-row r-sig">' +
+        sigCell('Signature of Preparer or Translator', p.signature) + cell('Date (mm/dd/yyyy)', fmtI9Date(p.signedDate)) +
+      '</div>' +
+      '<div class="i9-row r-name3">' +
+        cell('Last Name (Family Name)', p.lastName) + cell('First Name (Given Name)', p.firstName) +
+        cell('Middle Initial (if any)', p.middleInitial) +
+      '</div>' +
+      '<div class="i9-row r-addr4">' +
+        cell('Address (Street Number and Name)', p.address) + cell('City or Town', p.city) +
+        cell('State', p.state) + cell('ZIP Code', p.zip) +
+      '</div>' +
+      '<div class="i9-foot"><span></span><span>Form I-9 Edition ' + esc(f.edition) + ' &nbsp; Page 3 of 4</span></div>';
+  }
+
+  /* Page 2 word for word. The instructions require it to be available to
+     the employee while the form is being completed. */
+  function listsHTML() {
+    var L = GRYC.I9_LISTS;
+    function li(t) { return '<li>' + esc(t) + '</li>'; }
+    function col(k, extra) {
+      var c = L[k];
+      return '<div><h3>' + esc(c.title) + '</h3><div class="tiny muted mb-1">' + esc(c.sub) + '</div>' +
+        '<ol>' + c.items.map(li).join('') + '</ol>' + (extra || '') + '</div>';
+    }
+    return '<div class="i9lists">' +
+      '<ul class="small">' + L.intro.map(li).join('') + '</ul>' +
+      '<div class="grid c3">' +
+        col('A') +
+        col('B', '<p class="tiny strong mb-1 mt-1">' + esc(L.B.minorsHead) + '</p>' +
+          '<ol start="10">' + L.B.minors.map(li).join('') + '</ol>') +
+        col('C', '<p class="tiny mt-1 mb-0">' + esc(L.C.note) + '</p>') +
+      '</div>' +
+      '<h3 class="mt-2">' + esc(L.receipts.head) + '</h3><p class="tiny muted">' + esc(L.receipts.sub) + '</p>' +
+      '<div class="grid c3">' + ['A', 'B', 'C'].map(function (k) {
+        return '<div><div class="tiny strong">List ' + k + '</div><ul>' + L.receipts[k].map(li).join('') + '</ul></div>';
+      }).join('') + '</div>' +
+      '<p class="small mb-0"><a href="' + INSTRUCTIONS_URL + '" target="_blank" rel="noopener">Form I-9 instructions (USCIS)</a></p>' +
+    '</div>';
+  }
+
+  function showLists() {
+    GRYC.modal({ title: 'Lists of Acceptable Documents', wide: true, okText: null, body: listsHTML() });
+  }
+
+  function showSection1() {
+    GRYC.modal({
+      title: 'Section 1 as signed', wide: true, okText: null,
+      body: '<div class="paper i9doc">' + i9Doc(form, { only: 's1' }) + '</div>' +
+        (form.helper !== 'none' ? '<div class="paper i9doc mt-2">' + suppAHTML(form) + '</div>' : '')
+    });
+  }
+
+  /* One listener for every "document lists" link the page draws. */
+  $('#root').addEventListener('click', function (e) {
+    if (e.target.closest('[data-lists]')) { e.preventDefault(); showLists(); }
+  });
+
+  /* ======================================================================
+     WIZARD
+     ====================================================================== */
+
+  function renderWizard() {
+    var s1Done = form.status === 'section1';
+
+    $('#root').innerHTML =
+      '<div class="row between wrap-row mb-3">' +
+        '<div><h1>Form I-9</h1>' +
+        '<p class="muted mb-0">Employment Eligibility Verification · Edition ' + esc(form.edition) +
+          ' · employer: ' + esc(form.employer.name) + '</p></div>' +
+        '<div class="row wrap-row">' +
+          '<a class="btn ghost" href="' + INSTRUCTIONS_URL + '" target="_blank" rel="noopener">Instructions</a>' +
+          '<button class="btn ghost" data-lists>Document lists</button>' +
+          '<button class="btn ghost danger hidden" id="delete">Delete draft</button>' +
+          '<button class="btn" id="savedraft">Save draft</button>' +
+        '</div>' +
+      '</div>' +
+      (s1Done
+        ? '<div class="callout info mb-3"><strong>Section 1 was signed ' + esc(stamp(form.s1SignedAt)) + '</strong> by ' +
+          esc(s1Signer(form)) + '. Review it before completing Section 2 — if anything is wrong or missing, the ' +
+          'employee has to correct it and sign again.' +
+          '<div class="row wrap-row mt-1">' +
+            '<button class="btn sm" id="viewS1">View Section 1</button>' +
+            '<button class="btn sm" id="confirmS1">Print employee confirmation</button>' +
+            '<button class="btn sm ghost danger" id="reopenS1">Reopen Section 1 for correction</button>' +
+          '</div></div>'
+        : '') +
+      '<div class="steps" id="steps"></div>' +
+      '<div id="stepbody"></div>' +
+      '<div class="row between mt-3">' +
+        '<button class="btn" id="prev">← Cancel</button>' +
+        '<div class="row"><span class="tiny muted" id="stepcount"></span>' +
+        '<button class="btn primary" id="next">Continue →</button></div>' +
+      '</div>';
+
+    $('#savedraft').addEventListener('click', function () {
+      collect();
+      if (!saved && !touched()) { GRYC.toast('Nothing to save yet.', 'bad'); return; }
+      persist(s1Done ? 'Saved Section 2 as a draft' : 'Saved the draft');
+      GRYC.toast('Draft saved.', 'ok');
+      setTimeout(function () { location.href = 'dashboard.html'; }, 600);
+    });
+    $('#delete').addEventListener('click', function () {
+      GRYC.confirmBox('Delete this draft?',
+        'The answers on this I-9 are thrown away. Nothing was signed, so nothing leaves the record.',
+        'Delete draft', function () { GRYC.removeI9(form.id); location.href = 'dashboard.html'; });
+    });
+    $('#prev').addEventListener('click', function () {
+      collect();
+      if (step > (s1Done ? 4 : 1)) go(step - 1);
+      else location.href = 'dashboard.html';
+    });
+    $('#next').addEventListener('click', function () {
+      collect();
+      var miss = problems(step);
+      if (miss.length) { notReady(miss, 'A few answers are missing', 'Still needed on this step:'); return; }
+      go(step + 1);
+    });
+    if (s1Done) {
+      $('#viewS1').addEventListener('click', showSection1);
+      $('#confirmS1').addEventListener('click', printConfirmation);
+      $('#reopenS1').addEventListener('click', reopenS1);
+    }
+
+    paintStep();
+  }
+
+  function go(n) {
+    if (saved || touched()) persist();
+    step = n;
+    paintStep();
+  }
+
+  function paintStep() {
+    var s1Done = form.status === 'section1';
+    $('#steps').innerHTML = STEPS.map(function (s, i) {
+      var n = i + 1;
+      /* Section 1 can't be revisited once signed, and Section 2 can't start
+         until it is. */
+      var locked = s1Done ? n <= 3 : n >= 4;
+      var done = n < step || (s1Done && n <= 3);
+      return '<div class="st ' + (n === step ? 'on' : done ? 'done' : '') + (locked ? ' locked' : '') + '" ' +
+        'data-step="' + n + '"' + (locked ? ' title="' + (s1Done ? 'Signed' : 'Opens once Section 1 is signed') + '"' : '') + '>' +
+        '<div class="num">' + (done ? '✓' : n) + '</div>' +
+        '<div class="lb">' + esc(s.label) + '<span class="pg">' + esc(s.page) + '</span></div></div>';
+    }).join('');
+    $$('#steps .st').forEach(function (el) {
+      if (el.classList.contains('locked')) return;
+      el.addEventListener('click', function () { collect(); go(+el.dataset.step); });
+    });
+
+    $('#stepcount').textContent = 'Step ' + step + ' of ' + STEPS.length;
+    $('#prev').textContent = step === (s1Done ? 4 : 1) ? '← Dashboard' : '← Back';
+    /* Steps 3 and 5 submit from under the signature, so nothing sits
+       between the signature and the submission. */
+    $('#next').classList.toggle('hidden', step === 3 || step === 5);
+    $('#delete').classList.toggle('hidden', !(saved && form.status === 'draft'));
+
+    sigEmp = sigPrep = sigEr = null;
+    [stepOne, stepTwo, stepThree, stepFour, stepFive][step - 1]();
+    window.scrollTo(0, 0);
+  }
+
+  /* ---- step 1: who the employee is ------------------------------------ */
+
+  function stepOne() {
+    $('#stepbody').innerHTML =
+      card('Name', 'Section 1',
+        '<div class="grid c2">' +
+          field('e_last', 'Last name <span class="muted">(family name)</span>', form.lastName, {
+            req: true, attrs: ' autocomplete="family-name"' }) +
+          field('e_first', 'First name <span class="muted">(given name)</span>', form.firstName, {
+            req: true, attrs: ' autocomplete="given-name"' }) +
+          field('e_mi', 'Middle initial <span class="muted">(if any)</span>', form.middleInitial, {
+            mb0: true, attrs: ' maxlength="2"' }) +
+          field('e_other', 'Other last names used <span class="muted">(if any)</span>', form.otherLastNames, { mb0: true }) +
+        '</div>' +
+        '<div class="hint">The employee’s current legal name, with any hyphens or punctuation. Only one name? ' +
+          'Put it in Last name and type “Unknown” as the first name.</div>') +
+
+      card('Address', 'Section 1',
+        field('e_addr', 'Address <span class="muted">(street number and name)</span>', form.address, {
+          req: true, attrs: ' autocomplete="address-line1"' }) +
+        '<div class="grid c4">' +
+          field('e_apt', 'Apt. number <span class="muted">(if any)</span>', form.apt, { mb0: true }) +
+          field('e_city', 'City or town', form.city, { req: true, mb0: true, attrs: ' autocomplete="address-level2"' }) +
+          stateSelect('e_state', form.state, { mb0: true }) +
+          field('e_zip', 'ZIP code', form.zip, {
+            req: true, mb0: true, attrs: ' inputmode="numeric" maxlength="10" autocomplete="postal-code"' }) +
+        '</div>') +
+
+      card('Date of birth and contact', 'Section 1',
+        '<div class="grid c2">' +
+          field('e_dob', 'Date of birth', form.dob, {
+            req: true, type: 'date', attrs: ' max="' + GRYC.todayISO() + '"',
+            hint: '<span id="agehint">' + ageHint() + '</span>' }) +
+          field('e_ssn', 'U.S. Social Security number' + (EVERIFY ? '' : ' <span class="muted">(optional)</span>'),
+            fmtSsn(form.ssn), {
+              req: EVERIFY,
+              attrs: ' class="mono" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="123-45-6789"',
+              hint: EVERIFY
+                ? 'Required — the employer participates in E-Verify.'
+                : 'Voluntary unless the employer participates in E-Verify. Don’t enter an ITIN. Applied for one ' +
+                  'but don’t have it yet? Leave it blank.' }) +
+          field('e_email', 'Email address <span class="muted">(optional)</span>', form.email, {
+            type: 'email', mb0: true, attrs: ' autocomplete="email"' }) +
+          field('e_phone', 'Telephone number <span class="muted">(optional)</span>', form.phone, {
+            type: 'tel', mb0: true, attrs: ' autocomplete="tel"' }) +
+        '</div>' +
+        '<div class="err hidden" id="ssnerr"></div>' +
+        '<div class="callout mt-2"><strong>Demo build.</strong> This I-9 is saved in this browser only, without ' +
+          'encryption. Use made-up details — not a real Social Security, A-Number, or document number.</div>', true);
+
+    var ssn = $('#e_ssn');
+    ssn.addEventListener('input', function () {
+      ssn.value = fmtSsn(ssn.value.replace(/\D/g, '').slice(0, 9));
+      $('#ssnerr').classList.add('hidden');
+    });
+    ssn.addEventListener('blur', function () {
+      var d = ssn.value.replace(/\D/g, ''), p = d ? ssnProblem(d) : '';
+      $('#ssnerr').textContent = p ? 'That Social Security number ' + p + '.' : '';
+      $('#ssnerr').classList.toggle('hidden', !p);
+    });
+    $('#e_dob').addEventListener('change', function () {
+      form.dob = $('#e_dob').value;
+      $('#agehint').innerHTML = ageHint();
+    });
+    if (!form.lastName) $('#e_last').focus();
+  }
+
+  function ageHint() {
+    var a = ageToday();
+    if (a === null) return 'mm/dd/yyyy on the form.';
+    return 'Age ' + a + ' today.' + (a < 18 ? ' Under 18 — see Supplement A on step 3 if they have no List B identity document.' : '');
+  }
+
+  /* ---- step 2: citizenship or immigration status ---------------------- */
+
+  function stepTwo() {
+    var c = form.citizenship;
+    var HINTS = {
+      national: 'Someone born in American Samoa, certain former citizens of the former Trust Territory of the ' +
+        'Pacific Islands, and certain children of noncitizen nationals born abroad.',
+      lpr: 'Conditional residents choose this too. Asylees and refugees don’t — they choose item 4.',
+      alien: 'Someone authorized to work who is not a U.S. citizen, noncitizen national, or lawful permanent resident.'
+    };
+
+    $('#stepbody').innerHTML =
+      card('Citizenship or immigration status', 'Section 1',
+        '<div class="lbl req">' + esc(GRYC.I9_STATUS_PROMPT) + '</div>' +
+        GRYC.I9_STATUSES.map(function (s, i) {
+          return radioRow('cz', s.id, c === s.id,
+            (i + 1) + '. ' + s.text + (s.id === 'alien' ? ' (exp. date, if any)' : ''), HINTS[s.id]);
+        }).join('') +
+
+        (c === 'lpr'
+          ? '<div class="mt-2">' + field('e_lpr', 'USCIS Number (A-Number)', form.lprNumber, {
+              req: true, mb0: true, hint: '7 to 9 digits.',
+              attrs: ' class="mono" autocomplete="off" spellcheck="false" placeholder="A123456789"' }) + '</div>'
+          : '') +
+        (c === 'alien' ? alienFields() : '') +
+
+        '<p class="small muted mt-2 mb-0">The employer may not ask for documentation to verify what’s entered in ' +
+          'Section 1. <a href="#" data-lists>Lists of Acceptable Documents</a> · ' +
+          '<a href="' + INSTRUCTIONS_URL + '" target="_blank" rel="noopener">Form I-9 instructions</a></p>', true);
+
+    $$('input[name="cz"]').forEach(function (r) {
+      r.addEventListener('change', function () { collect(); stepTwo(); });
+    });
+    $$('input[name="aid"]').forEach(function (r) {
+      r.addEventListener('change', function () { collect(); stepTwo(); });
+    });
+    wireCheck('e_na', function () { collect(); stepTwo(); });
+  }
+
+  function alienFields() {
+    var t = form.alienIdType, mono = ' class="mono" autocomplete="off" spellcheck="false"';
+    return '<div class="mt-2">' +
+      '<div class="grid c2">' +
+        field('e_until', 'Authorized to work until', form.workUntilNA ? '' : form.workUntil, {
+          type: 'date', req: !form.workUntilNA, mb0: true, attrs: form.workUntilNA ? ' disabled' : '' }) +
+        '<div class="field mb-0"><div class="lbl">&nbsp;</div>' +
+          '<label class="check' + (form.workUntilNA ? ' on' : '') + '"><input type="checkbox" id="e_na"' +
+          (form.workUntilNA ? ' checked' : '') + '><span class="ct">No expiration date — enter N/A</span></label></div>' +
+      '</div>' +
+      '<div class="hint">Usually the date on the document that shows the employee can work — or, if the issuing ' +
+        'authority extended it automatically, the extension’s date. Refugees, asylees, and others whose ' +
+        'authorization doesn’t expire enter N/A.</div>' +
+      '<div class="lbl req mt-2">Enter one of these</div>' +
+      '<div class="rate mb-2">' + [['a', 'USCIS A-Number'], ['i94', 'Form I-94 Admission Number'], ['passport', 'Foreign passport']]
+        .map(function (o) {
+          return '<label><input type="radio" name="aid" value="' + o[0] + '"' + (t === o[0] ? ' checked' : '') + '>' +
+            '<span>' + o[1] + '</span></label>';
+        }).join('') + '</div>' +
+      (t === 'a' ? field('e_aa', 'USCIS A-Number', form.alienA, { req: true, mb0: true, hint: '7 to 9 digits.', attrs: mono }) : '') +
+      (t === 'i94' ? field('e_i94', 'Form I-94 Admission Number', form.i94, { req: true, mb0: true, hint: '11 characters.', attrs: mono }) : '') +
+      (t === 'passport'
+        ? '<div class="grid c2">' +
+            field('e_pp', 'Foreign passport number', form.passportNo, { req: true, mb0: true, attrs: mono }) +
+            field('e_ppc', 'Country of issuance', form.passportCountry, { req: true, mb0: true }) +
+          '</div>'
+        : '') +
+    '</div>';
+  }
+
+  /* ---- step 3: review, then the attestations and signatures ----------
+     8 CFR 274a.2(h): each signer acknowledges having read the attestation,
+     then signs; the signature is affixed when they press Sign. Who helped
+     and where it's being signed are settled first, so nothing changes
+     above a signature — and if something does, the signature is wiped. */
+
+  function stepThree() {
+    var earlier = problems(1).concat(problems(2));
+    if (form.helper === 'minor' && !minorAllowed()) form.helper = 'none';
+    var h = form.helper;
+    if (h === 'minor') form.s1Identity = 'inperson';
+
+    $('#stepbody').innerHTML =
+      (earlier.length
+        ? '<div class="callout mb-2"><strong>Some answers are still missing.</strong> Finish them before signing:' +
+          '<ul style="margin:6px 0 0;padding-left:18px">' +
+          earlier.map(function (m) { return '<li>' + esc(m) + '</li>'; }).join('') + '</ul></div>'
+        : '') +
+      '<p class="muted">This is Section 1 as it will appear on the form. Check every box — to change one, go back a step.</p>' +
+      '<div class="paper i9doc reveal mb-3">' + i9Doc(form, { only: 's1' }) + '</div>' +
+
+      card('Did anyone help fill in Section 1?', 'Supplement A',
+        radioRow('helper', 'none', h === 'none', 'No — the employee filled it in themselves') +
+        radioRow('helper', 'preparer', h === 'preparer', 'Yes — a preparer and/or translator helped',
+          'They fill in and sign Supplement A below. There’s no limit on how many can help; this page records one.') +
+        (minorAllowed()
+          ? radioRow('helper', 'minor', h === 'minor', 'The employee is under 18 and has no List B identity document',
+              'A parent or legal guardian completes Section 1, “' + GRYC.I9_MINOR + '” goes where the employee ' +
+              'signs, and the parent or guardian signs Supplement A (M-274 §4.2).')
+          : '') +
+        (isMinor() && EVERIFY
+          ? '<p class="small muted mb-0">E-Verify employers can’t use the parent-or-guardian procedure — a minor ' +
+            'needs a List A document, or a List B document with a photograph plus List C.</p>'
+          : '')) +
+
+      card('Where is Section 1 being signed?', 'Section 1',
+        radioRow('ident', 'inperson', form.s1Identity === 'inperson', 'Here, in person',
+          (h === 'minor' ? 'The parent or guardian' : 'The employee') + ' signs on this device with you present.') +
+        (h === 'minor' ? '' : radioRow('ident', 'self', form.s1Identity === 'self',
+          'It’s my own I-9 — I’m ' + user.name, 'Signed in as ' + user.email + '.'))) +
+
+      (h === 'minor'
+        ? card('Employee signature', 'Section 1',
+            '<p class="small mb-1">For a minor with no List B document, this goes in the employee signature block ' +
+              'instead of a signature:</p><div class="readout mono">' + esc(GRYC.I9_MINOR) + '</div>')
+        : card('Employee attestation', 'Section 1',
+            '<div class="attest">' + esc(GRYC.I9_S1_ATTEST) + '</div>' +
+            ackBox('s1ack', form.s1Ack, 'I have read the attestation above.') +
+            '<p class="inform"><strong>By signing, the employee makes this attestation under penalty of perjury.</strong> ' +
+              'Sign last — changing anything above clears the signature.</p>' +
+            sigPair('sigemp', 'Signature of Employee'))) +
+
+      (h !== 'none'
+        ? card('Preparer and/or translator certification', 'Supplement A',
+            preparerFields() +
+            '<div class="attest">' + esc(GRYC.I9_PREPARER_ATTEST) + '</div>' +
+            ackBox('prepack', form.prepAck, 'I have read the attestation above.') +
+            '<p class="inform"><strong>By signing, the ' + (h === 'minor' ? 'parent or guardian' : 'preparer or translator') +
+              ' makes this attestation under penalty of perjury.</strong></p>' +
+            sigPair('sigprep', 'Signature of Preparer or Translator'))
+        : '') +
+
+      '<button class="btn primary lg block" id="signs1">Sign Section 1</button>' +
+      '<p class="hint center mt-1 mb-0">Signing locks Section 1. Section 2 comes next, once the employee shows their documents.</p>';
+
+    if (h !== 'minor') {
+      sigEmpOpts = { label: 'Employee', defaultName: [form.firstName, form.lastName].filter(Boolean).join(' ') };
+      sigEmp = GRYC.signaturePad($('#sigemp'), sigEmpOpts);
+    }
+    if (h !== 'none') {
+      sigPrepOpts = { label: h === 'minor' ? 'Parent or legal guardian' : 'Preparer or translator', defaultName: prepName(form) };
+      sigPrep = GRYC.signaturePad($('#sigprep'), sigPrepOpts);
+    }
+
+    $$('input[name="helper"], input[name="ident"]').forEach(function (r) {
+      r.addEventListener('change', function () { collect(); stepThree(); });
+    });
+    wireCheck('s1ack', function (on) { if (!on) unsign(sigEmp); });
+    wireCheck('prepack', function (on) { if (!on) unsign(sigPrep); });
+    $$('#stepbody [id^="p_"]').forEach(function (el) {
+      el.addEventListener('input', function () {
+        sigPrepOpts.defaultName = [$('#p_first').value.trim(), $('#p_last').value.trim()].filter(Boolean).join(' ');
+        unsign(sigPrep);
+      });
+      el.addEventListener('change', function () { unsign(sigPrep); });
+    });
+    $('#signs1').addEventListener('click', signS1);
+  }
+
+  function preparerFields() {
+    var p = form.preparer;
+    return '<p class="small mb-2">' + (form.helper === 'minor'
+        ? 'The parent or legal guardian completing Section 1.' : 'The person who helped.') + '</p>' +
+      '<div class="grid c3">' +
+        field('p_last', 'Last name', p.lastName, { req: true }) +
+        field('p_first', 'First name', p.firstName, { req: true }) +
+        field('p_mi', 'Middle initial <span class="muted">(if any)</span>', p.middleInitial, { attrs: ' maxlength="2"' }) +
+      '</div>' +
+      field('p_addr', 'Address <span class="muted">(street number and name)</span>', p.address, { req: true }) +
+      '<div class="grid c3">' +
+        field('p_city', 'City or town', p.city, { req: true }) +
+        stateSelect('p_state', p.state) +
+        field('p_zip', 'ZIP code', p.zip, { req: true, attrs: ' inputmode="numeric" maxlength="10"' }) +
+      '</div>';
+  }
+
+  /* ---- step 4: the documents ------------------------------------------ */
+
+  function dueHint() {
+    var fd = $('#d_first') ? $('#d_first').value : form.firstDay;
+    if (!fd) return 'Section 2 is due within three business days after the first day.';
+    var due = GRYC.addBusinessDays(fd, 3);
+    return 'Section 2 is due by <b>' + esc(GRYC.fmtDate(due)) + '</b>' +
+      (GRYC.todayISO() > due ? ' — <span style="color:var(--bad)">that date has passed</span>' : '') +
+      '. Section 1 is due no later than the first day' +
+      (form.s1SignedDate && form.s1SignedDate > fd ? ' — it was signed ' + esc(GRYC.fmtDate(form.s1SignedDate)) + ', after it' : '') + '.';
+  }
+
+  function stepFour() {
+    tidy();   /* a minor-path I-9 reopened for Section 2 starts with its List B set */
+    var minorPath = form.helper === 'minor';
+
+    $('#stepbody').innerHTML =
+      '<div class="callout info mb-2"><strong>Anti-discrimination notice.</strong> ' +
+        esc(GRYC.I9_ANTI_DISCRIMINATION) + '</div>' +
+
+      card('First day of employment', 'Section 2',
+        field('d_first', 'First day of employment', form.firstDay, {
+          type: 'date', req: true, mb0: true, hint: '<span id="duehint">' + dueHint() + '</span>' })) +
+
+      card('Documents the employee chose to present', 'Section 2',
+        (minorPath
+          ? '<p class="small">The parent or guardian completed Section 1 for a minor with no List B document, so ' +
+            'List B is “' + esc(GRYC.I9_MINOR) + '”. Record the List C document the employee presented.</p>'
+          : '<div class="lbl req">Which did the employee present?</div>' +
+            '<div class="rate mb-1">' + [['A', 'One document from List A'], ['BC', 'One from List B and one from List C']]
+              .map(function (o) {
+                return '<label><input type="radio" name="docpath" value="' + o[0] + '"' +
+                  (form.docPath === o[0] ? ' checked' : '') + '><span>' + o[1] + '</span></label>';
+              }).join('') + '</div>') +
+        '<p class="hint mb-2">Examine the originals — photocopies aren’t acceptable, except a certified copy of a ' +
+          'birth certificate. Anything with an expiration date must be unexpired.' +
+          (EVERIFY ? ' E-Verify: a List B document must contain a photograph.' : '') +
+          ' <a href="#" data-lists>See the lists</a></p>' +
+        (form.docPath === 'A' ? listAFields() : form.docPath === 'BC' ? listBCFields(minorPath) : '')) +
+
+      card('Additional information', 'Section 2',
+        '<div class="field"><label for="d_addl">Additional information <span class="muted">(if any)</span></label>' +
+          '<textarea id="d_addl" rows="3">' + esc(form.additionalInfo) + '</textarea>' +
+          '<div class="hint">For notes the form calls for — more List A documents, extensions of employment ' +
+          'authorization, a replacement for a receipt. Initial and date each notation.</div></div>' +
+        '<label class="check' + (form.altProcedure ? ' on' : '') + '"><input type="checkbox" id="d_alt"' +
+          (form.altProcedure ? ' checked' : '') + '><span class="ct">' + esc(GRYC.I9_ALT_PROCEDURE) +
+          '<br><span class="small muted">Only if the documents were examined under a DHS-authorized alternative ' +
+          'procedure instead of in person (M-274 §4.5).</span></span></label>', true);
+
+    $$('input[name="docpath"]').forEach(function (r) {
+      r.addEventListener('change', function () { collect(); stepFour(); });
+    });
+    $$('[data-pick]').forEach(function (sel) {
+      sel.addEventListener('change', function () { pick(sel.dataset.pick, sel.value); });
+    });
+    $('#d_first').addEventListener('change', function () { $('#duehint').innerHTML = dueHint(); });
+    wireCheck('d_alt');
+  }
+
+  function pickSelect(list) {
+    return '<select id="pick_' + list + '" data-pick="' + list + '"><option value="">— choose to fill in the boxes —</option>' +
+      GRYC.I9_PICK[list].map(function (p, i) {
+        if (p.minor && !isMinor()) return '';
+        return '<option value="' + i + '">' + esc(p.label) + '</option>';
+      }).join('') + '</select>';
+  }
+
+  /* A pick fills the title and issuing authority the M-274 suggests; a
+     List A pick that is two documents fills two rows. */
+  function pick(list, idx) {
+    if (idx === '') return;
+    collect();
+    var p = GRYC.I9_PICK[list][+idx], st = form.state || 'NY';
+    function fill(pair) {
+      return { title: pair[0].replace('{st}', st), issuer: pair[1].replace('{st}', st), number: '', expiry: '' };
+    }
+    if (list === 'A') form.listA = [0, 1, 2].map(function (i) { return p.docs[i] ? fill(p.docs[i]) : blankDoc(); });
+    else form['list' + list] = fill(p.docs[0]);
+    stepFour();
+    var d = list === 'A' ? form.listA[0] : form['list' + list];
+    var next = $('#d_' + list + '0_' + (d.issuer ? 'number' : 'issuer'));
+    if (next) next.focus();
+  }
+
+  function docSlot(key, d, title, required) {
+    var pre = 'd_' + key + '_', mono = ' class="mono" autocomplete="off" spellcheck="false"';
+    return '<div class="docslot"><div class="lbl">' + esc(title) + '</div>' +
+      '<div class="grid c4">' +
+        field(pre + 'title', 'Document title', d.title, { req: required, mb0: true }) +
+        field(pre + 'issuer', 'Issuing authority', d.issuer, { req: required, mb0: true }) +
+        field(pre + 'number', 'Document number <span class="muted">(if any)</span>', d.number, { mb0: true, attrs: mono }) +
+        field(pre + 'expiry', 'Expiration date <span class="muted">(if any)</span>', d.expiry, { type: 'date', mb0: true }) +
+      '</div></div>';
+  }
+
+  function listAFields() {
+    return '<div class="field"><label for="pick_A">List A document</label>' + pickSelect('A') + '</div>' +
+      docSlot('A0', form.listA[0], 'Document 1', true) +
+      docSlot('A1', form.listA[1], 'Document 2 (if any) — for List A choices that are two documents', false) +
+      docSlot('A2', form.listA[2], 'Document 3 (if any)', false);
+  }
+
+  function listBCFields(minorPath) {
+    return (minorPath
+        ? '<div class="docslot"><div class="lbl">List B</div><div class="readout mono">' + esc(GRYC.I9_MINOR) + '</div></div>'
+        : '<div class="field"><label for="pick_B">List B document</label>' + pickSelect('B') + '</div>' +
+          docSlot('B0', form.listB, 'List B — identity', true)) +
+      '<div class="field mt-2"><label for="pick_C">List C document</label>' + pickSelect('C') + '</div>' +
+      docSlot('C0', form.listC, 'List C — employment authorization', true);
+  }
+
+  /* ---- step 5: review, then the employer's certification -------------- */
+
+  function stepFive() {
+    var earlier = problems(4);
+
+    $('#stepbody').innerHTML =
+      (earlier.length
+        ? '<div class="callout mb-2"><strong>Some answers are still missing.</strong> Finish them before signing:' +
+          '<ul style="margin:6px 0 0;padding-left:18px">' +
+          earlier.map(function (m) { return '<li>' + esc(m) + '</li>'; }).join('') + '</ul></div>'
+        : '') +
+      '<p class="muted">This is the whole form as ' + esc(form.employer.name) + ' will keep it. Check Section 2 ' +
+        'against the documents in front of you.</p>' +
+      '<div class="paper i9doc reveal mb-3">' + i9Doc(form) + '</div>' +
+
+      card('Employer or authorized representative', 'Section 2',
+        '<div class="grid c3">' +
+          field('r_last', 'Last name', form.repLast, { req: true, mb0: true }) +
+          field('r_first', 'First name', form.repFirst, { req: true, mb0: true }) +
+          field('r_title', 'Title', form.repTitle, { req: true, mb0: true }) +
+        '</div>' +
+        '<div class="lbl mt-2">Employer’s business or organization name and address</div>' +
+        '<div class="readout">' + esc(form.employer.name) + '<br>' + esc(form.employer.address) + ', ' +
+          esc(form.employer.city) + '</div>') +
+
+      '<div class="card"><div class="card-h"><h2>Certification</h2><div class="spacer"></div>' +
+        '<span class="badge">Section 2</span></div><div class="card-b">' +
+        '<div class="attest"><b>Certification:</b> ' + esc(GRYC.I9_S2_CERT) + '</div>' +
+        ackBox('s2ack', form.s2Ack, 'I have read the certification above.') +
+        '<p class="inform"><strong>By signing, you make this certification under penalty of perjury.</strong> Your ' +
+          'signature is the last entry: signing completes the Form I-9, and it can’t be changed afterward.</p>' +
+        sigPair('siger', 'Signature of Employer or Authorized Representative') +
+        '<button class="btn primary lg block mt-2" id="signs2">Sign Section 2 and complete the I-9</button>' +
+      '</div></div>';
+
+    sigErOpts = { label: 'Employer or authorized representative', defaultName: [form.repFirst, form.repLast].join(' ') };
+    sigEr = GRYC.signaturePad($('#siger'), sigErOpts);
+    ['r_last', 'r_first', 'r_title'].forEach(function (fid) {
+      $('#' + fid).addEventListener('input', function () {
+        sigErOpts.defaultName = [$('#r_first').value.trim(), $('#r_last').value.trim()].join(' ');
+        unsign(sigEr);
+      });
+    });
+    wireCheck('s2ack', function (on) { if (!on) unsign(sigEr); });
+    $('#signs2').addEventListener('click', signS2);
+  }
+
+  /* ---- reading the step back ------------------------------------------ */
+
+  function collect() {
+    function val(fid) { var el = $('#' + fid); return el ? el.value.trim() : null; }
+    function take(key, v, obj) { if (v !== null) (obj || form)[key] = v; }
+    function picked(name) {
+      if (!$('input[name="' + name + '"]')) return null;
+      var el = $('input[name="' + name + '"]:checked');
+      return el ? el.value : '';
+    }
+    function chk(fid, key) { var el = $('#' + fid); if (el) form[key] = el.checked; }
+    function initial(v) { return v === null ? null : v.replace(/[^A-Za-z]/g, '').slice(0, 1).toUpperCase(); }
+    function digits(v) { return v === null ? null : v.replace(/^\s*A/i, '').replace(/\D/g, ''); }
+
+    /* step 1 */
+    take('lastName', val('e_last'));
+    take('firstName', val('e_first'));
+    take('middleInitial', initial(val('e_mi')));
+    take('otherLastNames', val('e_other'));
+    take('address', val('e_addr'));
+    take('apt', val('e_apt'));
+    take('city', val('e_city'));
+    take('state', val('e_state'));
+    take('zip', val('e_zip'));
+    take('dob', val('e_dob'));
+    var s = val('e_ssn');
+    if (s !== null) form.ssn = s.replace(/\D/g, '').slice(0, 9);
+    take('email', val('e_email'));
+    take('phone', val('e_phone'));
+
+    /* step 2 */
+    take('citizenship', picked('cz'));
+    take('lprNumber', digits(val('e_lpr')));
+    chk('e_na', 'workUntilNA');
+    if ($('#e_until') && !$('#e_until').disabled) form.workUntil = $('#e_until').value;
+    take('alienIdType', picked('aid'));
+    take('alienA', digits(val('e_aa')));
+    var i94 = val('e_i94');
+    if (i94 !== null) form.i94 = i94.replace(/[\s-]/g, '').toUpperCase();
+    take('passportNo', val('e_pp'));
+    take('passportCountry', val('e_ppc'));
+
+    /* step 3 */
+    take('helper', picked('helper'));
+    take('s1Identity', picked('ident'));
+    chk('s1ack', 's1Ack');
+    chk('prepack', 'prepAck');
+    var p = form.preparer;
+    take('lastName', val('p_last'), p);
+    take('firstName', val('p_first'), p);
+    take('middleInitial', initial(val('p_mi')), p);
+    take('address', val('p_addr'), p);
+    take('city', val('p_city'), p);
+    take('state', val('p_state'), p);
+    take('zip', val('p_zip'), p);
+
+    /* step 4 */
+    take('firstDay', val('d_first'));
+    take('docPath', picked('docpath'));
+    [['A0', form.listA[0]], ['A1', form.listA[1]], ['A2', form.listA[2]], ['B0', form.listB], ['C0', form.listC]]
+      .forEach(function (x) {
+        ['title', 'issuer', 'number', 'expiry'].forEach(function (k) { take(k, val('d_' + x[0] + '_' + k), x[1]); });
+      });
+    take('additionalInfo', val('d_addl'));
+    chk('d_alt', 'altProcedure');
+
+    /* step 5 */
+    take('repLast', val('r_last'));
+    take('repFirst', val('r_first'));
+    take('repTitle', val('r_title'));
+    chk('s2ack', 's2Ack');
+
+    tidy();
+  }
+
+  /* Answers that stop applying are cleared, so the form never carries a box
+     nobody can see. Section 1 is only tidied while it is still a draft. */
+  function tidy() {
+    if (form.status === 'draft') {
+      if (form.citizenship !== 'lpr') form.lprNumber = '';
+      if (form.citizenship !== 'alien') { form.workUntil = ''; form.workUntilNA = false; form.alienIdType = ''; }
+      if (form.workUntilNA) form.workUntil = '';
+      if (form.alienIdType !== 'a') form.alienA = '';
+      if (form.alienIdType !== 'i94') form.i94 = '';
+      if (form.alienIdType !== 'passport') { form.passportNo = ''; form.passportCountry = ''; }
+      if (form.helper === 'minor') { form.s1Identity = 'inperson'; form.s1Ack = false; }
+    }
+    if (form.helper === 'minor') {
+      form.docPath = 'BC';
+      form.listB = { title: GRYC.I9_MINOR, issuer: '', number: '', expiry: '' };
+    }
+  }
+
+  /* What is still missing on step n. `sigs` carries the signature values
+     when a section is being signed. */
+  function problems(n, sigs) {
+    var out = [], f = form, today = GRYC.todayISO();
+    if (n === 1) {
+      if (!f.lastName) out.push('Last name');
+      if (!f.firstName) out.push('First name (only one name? type “Unknown”)');
+      if (!f.address) out.push('Address');
+      if (!f.city) out.push('City or town');
+      if (!f.zip) out.push('ZIP code');
+      else if (!/^\d{5}(-?\d{4})?$/.test(f.zip)) out.push('ZIP code should be 5 digits, or ZIP+4');
+      if (!f.dob) out.push('Date of birth');
+      else if (f.dob > today) out.push('Date of birth is in the future');
+      if (f.ssn) { var sp = ssnProblem(f.ssn); if (sp) out.push('Social Security number ' + sp); }
+      else if (EVERIFY) out.push('Social Security number (required for E-Verify)');
+      if (f.email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(f.email)) out.push('Email address doesn’t look right');
+    } else if (n === 2) {
+      if (!f.citizenship) out.push('Citizenship or immigration status — check one box');
+      if (f.citizenship === 'lpr' && !/^\d{7,9}$/.test(f.lprNumber)) out.push('USCIS Number (A-Number) — 7 to 9 digits');
+      if (f.citizenship === 'alien') {
+        if (!f.workUntilNA && !f.workUntil) out.push('Authorized to work until — a date, or N/A');
+        else if (!f.workUntilNA && f.workUntil < today) out.push('Authorized to work until — that date has passed');
+        if (!f.alienIdType) out.push('A USCIS A-Number, Form I-94 admission number, or foreign passport');
+        if (f.alienIdType === 'a' && !/^\d{7,9}$/.test(f.alienA)) out.push('USCIS A-Number — 7 to 9 digits');
+        if (f.alienIdType === 'i94' && !/^[A-Z0-9]{11}$/.test(f.i94)) out.push('Form I-94 admission number — 11 characters');
+        if (f.alienIdType === 'passport' && (!f.passportNo || !f.passportCountry)) {
+          out.push('Foreign passport number and country of issuance');
+        }
+      }
+    } else if (n === 3) {
+      if (f.helper === 'minor' && !minorAllowed()) {
+        out.push('The parent-or-guardian procedure is only for employees under 18' + (EVERIFY ? ', and not with E-Verify' : ''));
+      }
+      if (!f.s1Identity) out.push('Where Section 1 is being signed');
+      if (f.s1Identity === 'self') {
+        var last = norm(user.name).split(' ').pop();
+        if (f.lastName && norm(f.lastName).split(' ').indexOf(last) < 0) {
+          out.push('This I-9 is for ' + f.firstName + ' ' + f.lastName + ', but you are signed in as ' + user.name +
+            '. If the employee is someone else, choose “Here, in person”.');
+        }
+      }
+      if (f.helper !== 'minor') {
+        if (!f.s1Ack) out.push('Tick that the employee has read the attestation');
+        if (sigs) {
+          if (!sigs.emp) out.push('Signature of Employee');
+          else if (!typedMatches(sigs.emp, f.firstName, f.lastName)) {
+            out.push('A typed signature has to be the employee’s name: ' + f.firstName + ' ' + f.lastName);
+          }
+        }
+      }
+      if (f.helper !== 'none') {
+        var p = f.preparer;
+        if (!p.lastName || !p.firstName) out.push('Supplement A — the preparer’s name');
+        if (!p.address || !p.city || !p.state || !p.zip) out.push('Supplement A — the preparer’s address');
+        if (!f.prepAck) out.push('Tick that the preparer has read their attestation');
+        if (sigs) {
+          if (!sigs.prep) out.push('Signature of Preparer or Translator');
+          else if (!typedMatches(sigs.prep, p.firstName, p.lastName)) {
+            out.push('A typed signature has to be the preparer’s name: ' + prepName(f));
+          }
+        }
+      }
+    } else if (n === 4) {
+      if (!f.firstDay) out.push('First day of employment');
+      if (!f.docPath) out.push('Which documents the employee presented — List A, or List B and List C');
+      var docs = f.docPath === 'A'
+        ? [['List A document 1', f.listA[0], true], ['List A document 2', f.listA[1], false], ['List A document 3', f.listA[2], false]]
+        : f.docPath === 'BC'
+          ? (f.helper === 'minor' ? [] : [['List B document', f.listB, true]]).concat([['List C document', f.listC, true]])
+          : [];
+      docs.forEach(function (x) {
+        var d = x[1] || {};
+        if (x[2] || d.title || d.issuer || d.number || d.expiry) {
+          if (!d.title) out.push(x[0] + ' — title');
+          if (!d.issuer) out.push(x[0] + ' — issuing authority');
+        }
+        if (d.expiry && d.expiry < today) {
+          out.push(x[0] + ' expired ' + fmtI9Date(d.expiry) + ' — expired documents aren’t acceptable (if the ' +
+            'issuing authority extended it, enter the extended date)');
+        }
+      });
+    } else if (n === 5) {
+      if (!f.repLast || !f.repFirst) out.push('Your last and first name');
+      if (!f.repTitle) out.push('Your title');
+      if (!f.s2Ack) out.push('Tick that you have read the certification');
+      if (sigs) {
+        if (!sigs.er) out.push('Signature of Employer or Authorized Representative');
+        else if (!typedMatches(sigs.er, f.repFirst, f.repLast)) {
+          out.push('A typed signature has to be your name: ' + f.repFirst + ' ' + f.repLast);
+        }
+      }
+    }
+    return out;
+  }
+
+  function notReady(miss, title, lead) {
+    GRYC.modal({
+      title: title, okText: null,
+      body: '<p>' + esc(lead) + '</p><ul style="margin:0;padding-left:18px">' +
+        miss.map(function (m) { return '<li>' + esc(m) + '</li>'; }).join('') + '</ul>' +
+        (saved ? '<p class="hint mt-2 mb-0">Your answers are saved as a draft — nothing is lost.</p>' : '')
+    });
+  }
+
+  /* ---- signing --------------------------------------------------------- */
+
+  function signS1() {
+    collect();
+    var sigs = { emp: sigEmp ? sigEmp.value() : '', prep: sigPrep ? sigPrep.value() : '' };
+    var miss = [];
+    [1, 2, 3].forEach(function (n) {
+      problems(n, n === 3 ? sigs : null).forEach(function (m) { miss.push(STEPS[n - 1].label + ': ' + m); });
+    });
+    if (miss.length) {
+      if (saved || touched()) persist();
+      notReady(miss, 'Not ready to sign Section 1', 'Before Section 1 can be signed:');
+      return;
+    }
+
+    var now = new Date().toISOString(), today = GRYC.todayISO();
+    if (form.helper === 'none') { form.preparer = blankPreparer(); form.prepAck = false; }
+    else { form.preparer.signature = sigs.prep; form.preparer.signedAt = now; form.preparer.signedDate = today; }
+    form.employeeSig = form.helper === 'minor' ? 'minor' : sigs.emp;
+    form.s1SignedAt = now;
+    form.s1SignedDate = today;
+    form.s1By = { id: user.id, name: user.name, email: user.email };
+    form.s1Device = GRYC.deviceLabel();
+    form.status = 'section1';
+    form.s1Hash = GRYC.i9Fingerprint(form, 1);
+    persist('Signed Section 1', 'Signed by ' + s1Signer(form) +
+      (form.helper === 'preparer' ? '; Supplement A signed by ' + prepName(form) : '') +
+      ' — ' + s1IdentityText(form) + '; attestation acknowledged as read');
+
+    GRYC.toast('Section 1 signed.', 'ok');
+    step = 4;
+    render();
+  }
+
+  function signS2() {
+    collect();
+    var sigs = { er: sigEr ? sigEr.value() : '' };
+    var miss = [];
+    [4, 5].forEach(function (n) {
+      problems(n, n === 5 ? sigs : null).forEach(function (m) { miss.push(STEPS[n - 1].label + ': ' + m); });
+    });
+    if (miss.length) {
+      persist();
+      notReady(miss, 'Not ready to sign Section 2', 'Before Section 2 can be signed:');
+      return;
+    }
+
+    if (form.docPath === 'A') { form.listB = blankDoc(); form.listC = blankDoc(); }
+    else form.listA = [blankDoc(), blankDoc(), blankDoc()];
+    var now = new Date().toISOString();
+    form.employerSig = sigs.er;
+    form.s2SignedAt = now;
+    form.s2SignedDate = GRYC.todayISO();
+    form.s2By = { id: user.id, name: user.name, email: user.email };
+    form.s2Device = GRYC.deviceLabel();
+    form.status = 'complete';
+    form.s2Hash = GRYC.i9Fingerprint(form, 2);
+    var due = GRYC.i9Section2Due(form);
+    persist('Signed Section 2', 'Signed by ' + repName(form) + ' — the I-9 is complete' +
+      (form.s2SignedDate > due ? '; completed after the due date, ' + GRYC.fmtDate(due) : '') +
+      '; certification acknowledged as read');
+
+    GRYC.toast('I-9 complete and on file.', 'ok');
+    render();
+  }
+
+  /* Section 1 errors are the employee's to correct (instructions, Section 2
+     step 1). Reopening removes the signatures, keeps what was typed and the
+     Section 2 draft, and puts the reason in the audit trail. */
+  function reopenS1() {
+    GRYC.modal({
+      title: 'Reopen Section 1 for correction?', okText: 'Reopen Section 1',
+      body: '<p>The employee’s signature is removed' + (form.helper !== 'none' ? ', along with Supplement A’s,' : '') +
+        ' and they sign Section 1 again once it’s corrected. The audit trail keeps the reopening and your reason.</p>' +
+        '<div class="field mb-0"><label class="req" for="reopenwhy">What needs correcting?</label>' +
+        '<textarea id="reopenwhy" rows="3"></textarea></div>',
+      onOk: function (root) {
+        var why = GRYC.$('#reopenwhy', root).value.trim();
+        if (!why) { GRYC.toast('Say what needs correcting.', 'bad'); return false; }
+        form.status = 'draft';
+        form.employeeSig = ''; form.s1SignedAt = ''; form.s1SignedDate = ''; form.s1Hash = '';
+        form.s1By = null; form.s1Device = ''; form.s1Ack = false; form.prepAck = false;
+        form.preparer.signature = ''; form.preparer.signedAt = ''; form.preparer.signedDate = '';
+        persist('Reopened Section 1 for correction', why);
+        step = 1;
+        render();
+      }
+    });
+  }
+
+  /* 8 CFR 274a.2(h)(1)(iii): on request, a printed confirmation of the
+     signature for the person who signed. The SSN stays masked on it. */
+  function printConfirmation() {
+    $('#confirm').innerHTML =
+      '<div class="paper i9doc keep-mask">' + i9Doc(form, { only: 's1' }) + '</div>' +
+      (form.helper !== 'none' ? '<div class="paper i9doc keep-mask print-break">' + suppAHTML(form) + '</div>' : '') +
+      '<div class="confirm-box">' +
+        '<h2>Confirmation of electronic signature</h2>' +
+        '<p>Section 1 of Form I-9 for <b>' + esc(GRYC.i9Name(form)) + '</b> was signed electronically on <b>' +
+          esc(stamp(form.s1SignedAt)) + '</b> by ' + esc(s1Signer(form)) +
+          (form.helper === 'preparer' ? ', with Supplement A signed by ' + esc(prepName(form)) : '') + '.</p>' +
+        '<p>' + esc(s1IdentityText(form)) + ' · ' + esc(form.s1Device || '') + '</p>' +
+        '<p class="mono small">Section 1 fingerprint (SHA-256): ' + esc(form.s1Hash) + '</p>' +
+        '<p class="small mb-0">Printed at the employee’s request on ' + esc(stamp(new Date().toISOString())) +
+          ' by ' + esc(user.name) + ' (' + esc(form.employer.name) + ')</p>' +
+      '</div>';
+    GRYC.logAccess(form, 'Printed the employee’s confirmation', 'Section 1, at the employee’s request');
+    GRYC.putI9(form);
+    if ($('#i9log')) paintLog();
+    printingConfirm = true;
+    document.body.classList.add('print-confirm');
+    window.print();
+    document.body.classList.remove('print-confirm');
+    printingConfirm = false;
+  }
+
+  /* ======================================================================
+     COMPLETE — the form as signed, and the record behind it
+     ====================================================================== */
+
+  function renderView() {
+    var ok1 = GRYC.i9Fingerprint(form, 1) === form.s1Hash;
+    var ok2 = GRYC.i9Fingerprint(form, 2) === form.s2Hash;
+    var due = GRYC.i9Section2Due(form), rv = GRYC.i9ReverifyBy(form), keep = GRYC.i9RetainUntil(form);
+    var lateS1 = form.firstDay && form.s1SignedDate > form.firstDay;
+    var lateS2 = due && form.s2SignedDate > due;
+    var p = form.preparer || {};
+
+    $('#root').innerHTML =
+      '<div class="row between wrap-row mb-3 no-print">' +
+        '<div><h1><span class="nowrap">Form I-9</span> — ' + esc(GRYC.i9Name(form)) + '</h1>' +
+        '<p class="muted mb-0">' + esc(statusLine(form)) + ' · first day ' + esc(GRYC.fmtDate(form.firstDay)) + '</p></div>' +
+        '<div class="row wrap-row">' +
+          '<span class="badge ok"><span class="dot"></span>Complete ' + esc(GRYC.fmtDate(form.s2SignedDate)) + '</span>' +
+          '<button class="btn" id="ssntoggle">Show full SSN</button>' +
+          '<button class="btn" id="confirmS1">Employee confirmation</button>' +
+          '<button class="btn" id="print" title="Prints with the full SSN, as an inspection copy must">Print / Save PDF</button>' +
+        '</div>' +
+      '</div>' +
+
+      (lateS1
+        ? '<div class="callout mb-2 no-print">Section 1 was signed ' + esc(GRYC.fmtDate(form.s1SignedDate)) +
+          ', after the first day of employment (' + esc(GRYC.fmtDate(form.firstDay)) + '). It’s due no later than the first day.</div>'
+        : '') +
+      (lateS2
+        ? '<div class="callout mb-2 no-print">Section 2 was completed ' + esc(GRYC.fmtDate(form.s2SignedDate)) +
+          ', after its due date of ' + esc(GRYC.fmtDate(due)) + '.</div>'
+        : '') +
+      (rv
+        ? '<div class="callout info mb-2 no-print"><strong>Reverify by ' + esc(GRYC.fmtDate(rv)) + '.</strong> The ' +
+          'employee’s work authorization or a List A/C document expires then; reverification goes on Supplement B, ' +
+          'which this portal doesn’t fill in yet.</div>'
+        : '') +
+
+      '<div class="paper i9doc" id="doc">' + i9Doc(form) + '</div>' +
+      (form.helper !== 'none' ? '<div class="paper i9doc mt-3 print-break" id="docA">' + suppAHTML(form) + '</div>' : '') +
+
+      '<div class="card mt-3 print-break">' +
+        '<div class="card-h" style="flex-wrap:wrap"><h2>Electronic record — Form I-9</h2><div class="spacer"></div>' +
+          (ok1 && ok2 ? '<span class="badge ok">✓ Unchanged since it was signed</span>'
+                      : '<span class="badge bad">✕ Changed after it was signed</span>') + '</div>' +
+        '<div class="card-b">' +
+          (ok1 && ok2 ? '' :
+            '<div class="callout mb-2" style="border-left-color:var(--bad);background:var(--bad-bg)">' +
+            (ok1 ? 'Section 2' : 'Section 1') + ' no longer matches the fingerprint taken when it was signed. ' +
+            'Don’t rely on this record — find out what changed.</div>') +
+          '<div class="grid c2">' +
+            kv('Employee', GRYC.i9Name(form)) +
+            kv('Citizenship or immigration status', statusLine(form)) +
+            kv('Section 1 signed', stamp(form.s1SignedAt) + ' · ' + s1Signer(form)) +
+            kv('How Section 1 was signed', s1IdentityText(form)) +
+            kv('Supplement A', form.helper === 'none' ? 'Not used'
+              : prepName(form) + (form.helper === 'minor' ? ' (parent or legal guardian)' : '') + ' · ' + stamp(p.signedAt)) +
+            kv('Section 2 signed', stamp(form.s2SignedAt) + ' · ' + repName(form)) +
+            kv('First day of employment', GRYC.fmtDate(form.firstDay) + ' · Section 2 due ' + GRYC.fmtDate(due) +
+              (lateS2 ? ' — completed late' : ' — on time')) +
+            kv('Reverify by', rv ? GRYC.fmtDate(rv) + ' (Supplement B)' : 'Not required') +
+            kv('Keep until at least', GRYC.fmtDate(keep) + ', or one year after employment ends if that is later') +
+            kv('Collected by', (form.s2By || form.s1By || {}).name + ' (' + ((form.s2By || form.s1By || {}).email || '') + ')') +
+            kv('Devices', 'Section 1: ' + (form.s1Device || '—') + ' · Section 2: ' + (form.s2Device || '—')) +
+            kv('Signatures', 'Each attestation was acknowledged as read before it was signed') +
+          '</div>' +
+          '<div class="lbl mt-2">Section 1 fingerprint (SHA-256) ' + (ok1 ? '✓' : '✕') + '</div>' +
+          '<div class="mono small hashbox">' + esc(form.s1Hash) + '</div>' +
+          '<div class="lbl mt-2">Whole-form fingerprint at Section 2 (SHA-256) ' + (ok2 ? '✓' : '✕') + '</div>' +
+          '<div class="mono small hashbox">' + esc(form.s2Hash) + '</div>' +
+        '</div>' +
+        '<div class="card-h loghead"><h3>Audit trail</h3><span class="badge" id="logcount"></span></div>' +
+        '<div class="tbl-wrap" id="i9log"></div>' +
+      '</div>';
+
+    paintLog();
+
+    $('#ssntoggle').addEventListener('click', function () {
+      var doc = $('#doc'), on = !doc.classList.contains('reveal');
+      doc.classList.toggle('reveal', on);
+      $('#ssntoggle').textContent = on ? 'Hide SSN' : 'Show full SSN';
+      if (on) { GRYC.logAccess(form, 'Showed the full SSN'); GRYC.putI9(form); paintLog(); }
+    });
+    $('#confirmS1').addEventListener('click', printConfirmation);
+    $('#print').addEventListener('click', function () { window.print(); });
+
+    /* Ctrl+P counts too — a printed copy carries the full SSN. */
+    if (!printHooked) {
+      printHooked = true;
+      window.addEventListener('beforeprint', function () {
+        if (printingConfirm || form.status !== 'complete') return;
+        GRYC.logAccess(form, 'Printed', 'Hard copy, with the full SSN');
+        GRYC.putI9(form);
+        paintLog();
+      });
+    }
+  }
+
+  function kv(k, v) {
+    return '<div><div class="lbl">' + esc(k) + '</div><div class="small strong">' + esc(v || '—') + '</div></div>';
+  }
+
+  function paintLog() {
+    var log = form.audit || [];
+    $('#logcount').textContent = log.length;
+    $('#i9log').innerHTML = '<table class="tbl"><thead><tr><th>When</th><th>Who</th><th>What</th><th>Device</th>' +
+      '</tr></thead><tbody>' + log.map(function (e) {
+        return '<tr><td class="nowrap">' + esc(stamp(e.at)) + '</td>' +
+          '<td>' + esc(e.who) + (e.email ? '<div class="tiny muted">' + esc(e.email) + '</div>' : '') + '</td>' +
+          '<td><span class="strong">' + esc(e.what) + '</span>' +
+            (e.detail ? '<div class="tiny muted">' + esc(e.detail) + '</div>' : '') + '</td>' +
+          '<td class="small muted">' + esc(e.device || '—') + '</td></tr>';
+      }).join('') + '</tbody></table>';
+  }
+
+  function render() {
+    if (form.status === 'complete') renderView();
+    else renderWizard();
+    window.scrollTo(0, 0);
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>

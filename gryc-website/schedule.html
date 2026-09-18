@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>This Week · GRYC SYEP Site Monitor Portal</title>
+<link rel="icon" href="assets/images/gryc_logo.png">
+<link rel="stylesheet" href="assets/styles.css?v=15">
+</head>
+<body>
+
+<main class="page"><div class="wrap">
+
+  <div class="row between wrap-row mb-3">
+    <div>
+      <h1 id="title">This Week</h1>
+      <p class="muted mb-0" id="sub"></p>
+    </div>
+    <button class="btn no-print" onclick="window.print()">Print worklist</button>
+  </div>
+
+  <div class="card mb-3">
+    <div class="card-h"><h2>What&rsquo;s outstanding</h2><div class="spacer"></div><span class="badge" id="openbadge"></span></div>
+    <div id="todo"></div>
+  </div>
+
+  <h2 class="sec-title">Site by site</h2>
+  <div class="card mb-3"><div class="tbl-wrap"><table class="tbl" id="matrix"></table></div>
+    <div class="card-f tiny muted">
+      <span class="badge ok">✓</span> assessment filed and timesheets in ·
+      <span class="badge warn">TS</span> assessment filed, timesheets outstanding ·
+      <span class="badge warn">Draft</span> assessment started ·
+      <span class="badge bad">Due</span> nothing filed
+    </div>
+  </div>
+
+  <h2 class="sec-title">Mileage this week</h2>
+  <div class="card"><div id="mileage"></div></div>
+
+</div></main>
+
+<script src="assets/data.js?v=15"></script>
+<script src="assets/app.js?v=15"></script>
+<script>
+(function () {
+  var $ = GRYC.$, esc = GRYC.esc;
+  var user = GRYC.requireAuth();
+  if (!user) return;
+  GRYC.renderHeader('week');
+
+  var cw = GRYC.currentWeek();
+  var wk = GRYC.week(cw);
+  var sites = GRYC.mySites();
+
+  $('#title').textContent = 'Week ' + cw + ' worklist';
+  $('#sub').textContent =
+    GRYC.fmtDate(wk.start) + ' – ' + GRYC.fmtDate(wk.end) +
+    ' · week ending ' + GRYC.fmtSlash(wk.ending) +
+    ' · ' + sites.length + ' sites · ' +
+    sites.reduce(function (n, s) { return n + GRYC.activeParticipants(s).length; }, 0) + ' participants';
+
+  /* ---- to-do list across all sites ---- */
+
+  /* PS 106 has 51 active participants, so "who is missing this?" has to stop
+     naming names at some point or the line swamps the worklist. */
+  function names(list, cap) {
+    cap = cap || 6;
+    var shown = list.slice(0, cap).map(function (p) { return GRYC.proster(p); }).join(', ');
+    return list.length > cap ? shown + ' (+' + (list.length - cap) + ' more)' : shown;
+  }
+
+  var todo = [];
+  sites.forEach(function (s) {
+    var w = GRYC.weekData(s, cw);
+    var people = GRYC.activeParticipants(s);
+    var visited = (s.log || []).some(function (l) { return l.date >= wk.start && l.date <= wk.ending; });
+    var a = w.assessment;
+
+    if (!visited) {
+      todo.push([s, 'Site visit', 'Check in at the worksite and sign the monitoring log',
+        'site.html?id=' + s.id, 'bad']);
+    }
+    if (w.timesheets.status !== 'collected') {
+      todo.push([s, 'Timesheets', 'Collect ' + people.length + ' signed timesheet(s) for week ending ' +
+        GRYC.fmtSlash(wk.ending), 'site.html?id=' + s.id + '&tab=weekly&week=' + cw, 'warn']);
+    }
+    if (!a || a.status !== 'submitted') {
+      todo.push([s, 'Worksite assessment', a ? 'Finish the saved draft' : 'Complete the 6-page assessment packet',
+        'assessment.html?site=' + s.id + '&week=' + cw, 'bad']);
+
+      var done = a ? (a.interviews || []).filter(function (iv) {
+        return iv.lastName && GRYC.INTERVIEW_Q.every(function (q) { return iv.answers && iv.answers[q.id]; });
+      }).length : 0;
+      if (done < GRYC.INTERVIEWS_REQUIRED) {
+        todo.push([s, 'Participant interviews', (GRYC.INTERVIEWS_REQUIRED - done) +
+          ' of ' + GRYC.INTERVIEWS_REQUIRED + ' still to do — must be in private',
+          'assessment.html?site=' + s.id + '&week=' + cw, 'warn']);
+      }
+    } else {
+      var flags = GRYC.findings(a, s);
+      if (flags.length) {
+        todo.push([s, 'Follow-up', flags.length + ' flagged item(s): ' + flags[0] +
+          (flags.length > 1 ? ' (+' + (flags.length - 1) + ' more)' : ''),
+          'assessment.html?site=' + s.id + '&week=' + cw + '&view=1', 'warn']);
+      }
+    }
+
+    if (cw === 3 || cw === 6) {
+      var k = cw === 3 ? 'week3' : 'week6';
+      var left = people.filter(function (p) { return !p.docs[k]; });
+      if (left.length) {
+        todo.push([s, 'Week ' + cw + ' evaluations', left.length + ' signed evaluation(s) not back yet: ' + names(left),
+          'site.html?id=' + s.id + '&tab=participants', 'warn']);
+      }
+    }
+
+    var missingRef = people.filter(function (p) { return !p.docs.referral; });
+    if (missingRef.length) {
+      todo.push([s, 'Referral sheets', missingRef.length + ' missing: ' + names(missingRef),
+        'site.html?id=' + s.id + '&tab=participants', 'warn']);
+    }
+    if (s.childcare) {
+      var missingCC = people.filter(function (p) { return !p.docs.childcare; });
+      if (missingCC.length) {
+        todo.push([s, 'Childcare questionnaires', missingCC.length + ' still to fill out: ' + names(missingCC),
+          'site.html?id=' + s.id + '&tab=participants', 'warn']);
+      }
+    }
+    if (!s.applicationOnFile) {
+      todo.push([s, 'Worksite Application', 'Nothing on file — the assessment cannot pre-fill without it',
+        'site.html?id=' + s.id + '&tab=application', 'warn']);
+    }
+  });
+
+  $('#openbadge').textContent = todo.length + ' open item' + (todo.length === 1 ? '' : 's');
+  $('#openbadge').className = 'badge ' + (todo.length ? 'warn' : 'ok');
+
+  $('#todo').innerHTML = todo.length
+    ? '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Worksite</th><th>Task</th><th>Detail</th><th></th>' +
+      '</tr></thead><tbody>' +
+      todo.map(function (t) {
+        return '<tr>' +
+          '<td class="strong nowrap">' + esc(t[0].emoji) + ' ' + esc(t[0].name) + '</td>' +
+          '<td><span class="badge ' + t[4] + '">' + esc(t[1]) + '</span></td>' +
+          '<td class="small muted">' + esc(t[2]) + '</td>' +
+          '<td class="right no-print"><a class="btn sm" href="' + esc(t[3]) + '">Open</a></td>' +
+        '</tr>';
+      }).join('') + '</tbody></table></div>'
+    : '<div class="empty"><div class="big">🎉</div><p class="strong">Week ' + cw + ' is fully closed out</p>' +
+      '<p class="muted">Every site visited, all timesheets in, all assessments filed.</p></div>';
+
+  /* ---- matrix of every week x site ---- */
+  $('#matrix').innerHTML =
+    '<thead><tr><th>Worksite</th>' +
+      GRYC.WEEKS.map(function (w) {
+        return '<th class="center">Wk ' + w.n +
+          '<div class="tiny muted" style="font-weight:500;text-transform:none;letter-spacing:0">' +
+          esc(GRYC.fmtShort(w.start)) + '</div></th>';
+      }).join('') +
+    '</tr></thead><tbody>' +
+    sites.map(function (s) {
+      return '<tr><td class="strong nowrap"><a href="site.html?id=' + esc(s.id) + '">' +
+        esc(s.emoji) + ' ' + esc(s.name) + '</a></td>' +
+        GRYC.WEEKS.map(function (w) {
+          var d = s.weeks[w.n];
+          var a = d && d.assessment;
+          var ts = d && d.timesheets && d.timesheets.status === 'collected';
+          var cell;
+          if (w.n > cw) cell = '<span class="muted tiny">—</span>';
+          else if (a && a.status === 'submitted' && ts) cell = '<span class="badge ok">✓</span>';
+          else if (a && a.status === 'submitted') cell = '<span class="badge warn">TS</span>';
+          else if (a) cell = '<span class="badge warn">Draft</span>';
+          else cell = '<span class="badge bad">Due</span>';
+          return '<td class="center"><a href="site.html?id=' + esc(s.id) + '&tab=weekly&week=' + w.n + '">' +
+            cell + '</a></td>';
+        }).join('') + '</tr>';
+    }).join('') + '</tbody>';
+
+  /* ---- mileage recap ---- */
+  var trips = GRYC.myMileage().filter(function (m) {
+    return m.date >= wk.start && m.date <= wk.ending;
+  }).sort(function (a, b) { return a.date.localeCompare(b.date); });
+
+  $('#mileage').innerHTML = trips.length
+    ? '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Date</th><th>From</th><th>To</th>' +
+      '<th class="right">Total Mileage</th></tr></thead><tbody>' +
+      trips.map(function (m) {
+        return '<tr><td class="nowrap">' + esc(GRYC.fmtSlash(m.date)) + '</td>' +
+          '<td>' + esc(m.from) + '</td><td>' + esc(m.to) + '</td>' +
+          '<td class="right mono">' + esc(m.total || '—') + '</td></tr>';
+      }).join('') +
+      '<tr><td colspan="3" class="right strong">Total</td><td class="right mono strong">' +
+        esc(GRYC.mileageTotal(trips) || '—') + '</td></tr>' +
+      '</tbody></table></div>' +
+      '<div class="card-f no-print"><a class="btn sm" href="mileage.html">Open mileage form</a></div>'
+    : '<div class="empty"><div class="big">🚗</div><p class="strong">No trips logged this week</p>' +
+      '<p class="muted">The mileage form is due with your timesheet.</p>' +
+      '<a class="btn no-print" href="mileage.html">Log a trip</a></div>';
+})();
+</script>
+</body>
+</html>
